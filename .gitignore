@@ -10,3 +10,4 @@ functions/index.js.backup*
 functions/node_modules/
 functions/.env
 functions/.runtimeconfig.json
+.DS_Store

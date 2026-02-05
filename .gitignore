@@ -1,0 +1,12 @@
+node_modules/
+*.log
+.env
+
+# Never commit legacy folders / backups
+OLD_IGNORE/
+functions/index.js.backup*
+
+# Never commit runtime config, env files, or node_modules inside functions/
+functions/node_modules/
+functions/.env
+functions/.runtimeconfig.json

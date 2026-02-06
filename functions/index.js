@@ -1779,6 +1779,7 @@ const handleCreateCheckoutSession = async (req, res) => {
         const couponLower = couponTrim.toLowerCase();
         const couponUpper = couponTrim.toUpperCase();
         const isHarbourview = couponLower === "harbourview";
+        const isGoldy = couponLower === "goldy";
 
         const candidateTokenIds = Array.from(new Set([couponTrim, couponLower, couponUpper])).filter(Boolean);
         console.log(`Looking up promo token. entered="${couponTrim}" candidates=${JSON.stringify(candidateTokenIds)}`);
@@ -1794,13 +1795,13 @@ const handleCreateCheckoutSession = async (req, res) => {
           }
         }
 
-        // Safety-net for your flagship promo: HARBOURVIEW should always yield a 30-day free trial.
+        // Safety-net promos: should always yield a 30-day free trial.
         // This prevents accidental immediate charges when the Firestore token is missing/misconfigured.
-        if ((!tokenDoc || !tokenDoc.exists) && couponLower === "harbourview") {
+        if ((!tokenDoc || !tokenDoc.exists) && (isHarbourview || isGoldy)) {
           console.warn(
-            'HARBOURVIEW promo token not found in Firestore. Applying fallback 30-day trial to prevent immediate charge.'
+            `${couponLower.toUpperCase()} promo token not found in Firestore. Applying fallback 30-day trial to prevent immediate charge.`
           );
-          tokenIdUsed = tokenIdUsed || "harbourview";
+          tokenIdUsed = tokenIdUsed || couponLower;
           tokenDoc = {
             exists: true,
             data: () => ({ daysFree: 30, reusable: true, fallback: true }),
@@ -1823,12 +1824,11 @@ const handleCreateCheckoutSession = async (req, res) => {
           
           // Handle free days - add trial period (prioritize this over percentage discounts)
           // If daysFree is set, use trial period instead of charging immediately
-          const effectiveDaysFree =
-            isHarbourview ? 30 : tokenData.daysFree;
+          const effectiveDaysFree = (isHarbourview || isGoldy) ? 30 : tokenData.daysFree;
 
           if (effectiveDaysFree !== undefined && effectiveDaysFree !== null) {
             const freeDays = Number(effectiveDaysFree) + TRIAL_PERIOD_DAYS;
-            console.log(`Promo code daysFree: ${effectiveDaysFree} (harbourview override=${isHarbourview}), total trial days: ${freeDays}`);
+            console.log(`Promo code daysFree: ${effectiveDaysFree} (override=${isHarbourview || isGoldy}), total trial days: ${freeDays}`);
             if (freeDays > 0) {
               // Ensure subscription_data exists
               if (!sessionParams.subscription_data) {
@@ -2788,9 +2788,9 @@ const validateCouponToken = (token, res) => {
       }
 
       if (!foundDoc) {
-        // Safety-net for your flagship promo: HARBOURVIEW should always validate as 30 days free.
-        if (tokenLower === "harbourview") {
-          return res.send(200, { daysFree: 30, reusable: true, fallback: true, canonicalTokenId: "harbourview" });
+        // Safety-net promos: should always validate as 30 days free.
+        if (tokenLower === "harbourview" || tokenLower === "goldy") {
+          return res.send(200, { daysFree: 30, reusable: true, fallback: true, canonicalTokenId: tokenLower });
         }
         return res.send(404);
       }
@@ -2801,9 +2801,9 @@ const validateCouponToken = (token, res) => {
       // Helpful for debugging/consistency downstream
       responseObj.canonicalTokenId = foundId;
 
-      // Safety-net for your flagship promo: HARBOURVIEW should always be treated as 30 days free,
+      // Safety-net promos: should always be treated as 30 days free,
       // even if the Firestore doc exists but is missing/misconfigured.
-      if (tokenLower === "harbourview") {
+      if (tokenLower === "harbourview" || tokenLower === "goldy") {
         const daysFreeNum = Number(responseObj.daysFree || 0);
         if (!daysFreeNum) {
           responseObj.daysFree = 30;

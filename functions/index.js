@@ -535,6 +535,12 @@ const billingPlanUpdateAttributes = [
 // const getBillingPlanObject = (req) => {}
 const billingPlanFn = (req, outerRes) => {
   const uid = req.body.uid;
+  if (uid) {
+    admin.firestore().collection("members").doc(uid).set(
+      { lastPayPalCheckoutStartedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    ).catch(err => console.warn("Ensure members doc (PayPal):", err.message));
+  }
   const billingPlanAttributes = getBillingPlanObject(req);
 
   paypal.billingPlan.create(billingPlanAttributes, (error, billingPlan) => {
@@ -698,6 +704,8 @@ const executePaymentAgreement = (token, uid, req, res) => {
           {
             subscriptionId: billingAgreement.id,
             subscriptionExpires: date,
+            subscriptionActive: true,
+            paymentMethod: "paypal",
           },
           { merge: true }
         )
@@ -1727,12 +1735,32 @@ exports.stripeCreateCheckoutSession = functions.https.onRequest((req, res) => {
 
 const handleCreateCheckoutSession = async (req, res) => {
   try {
-    console.log("Creating checkout session with body:", req.body);
-    const { priceId, email, uid, coupon, tierName } = req.body;
+    // Ensure body is parsed (Firebase may pass raw body; parse JSON if needed)
+    let body = req.body;
+    if ((body === undefined || body === null) && req.rawBody) {
+      try {
+        body = typeof req.rawBody === 'string' ? JSON.parse(req.rawBody) : JSON.parse(req.rawBody.toString());
+      } catch (e) {
+        console.warn("Could not parse request body:", e.message);
+      }
+    }
+    body = body || {};
+    console.log("Creating checkout session with body:", body, "coupon present:", !!body.coupon);
+    const { priceId, email, uid, coupon, tierName } = body;
     
     if (!priceId || !email || !uid) {
       console.error("Missing required parameters:", { priceId: !!priceId, email: !!email, uid: !!uid });
       return res.status(400).json({ error: 'Missing required parameters: priceId, email, and uid are required' });
+    }
+
+    // Ensure members doc exists so webhook/success can always update it (avoids "no doc" when webhook or success fails)
+    try {
+      await admin.firestore().collection("members").doc(uid).set(
+        { lastCheckoutStartedAt: admin.firestore.FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+    } catch (ensureErr) {
+      console.warn("Could not ensure members doc exists (non-fatal):", ensureErr.message);
     }
 
     // Build success and cancel URLs
@@ -1774,15 +1802,16 @@ const handleCreateCheckoutSession = async (req, res) => {
     // Add coupon if provided (promo token in Firestore)
     if (coupon && coupon !== '') {
       try {
-        // Try multiple Firestore doc IDs to handle legacy casing.
+        // Try multiple Firestore doc IDs to handle legacy casing and spaces (e.g. "harbour view" -> harbourview).
         const couponTrim = String(coupon).trim();
         const couponLower = couponTrim.toLowerCase();
+        const couponNoSpaces = couponLower.replace(/\s+/g, '');
         const couponUpper = couponTrim.toUpperCase();
-        const isHarbourview = couponLower === "harbourview";
-        const isGoldy = couponLower === "goldy";
+        const isHarbourview = couponNoSpaces === "harbourview";
+        const isGoldy = couponNoSpaces === "goldy";
 
-        const candidateTokenIds = Array.from(new Set([couponTrim, couponLower, couponUpper])).filter(Boolean);
-        console.log(`Looking up promo token. entered="${couponTrim}" candidates=${JSON.stringify(candidateTokenIds)}`);
+        const candidateTokenIds = Array.from(new Set([couponTrim, couponLower, couponNoSpaces, couponUpper])).filter(Boolean);
+        console.log(`Looking up promo token. entered="${couponTrim}" normalized="${couponNoSpaces}" candidates=${JSON.stringify(candidateTokenIds)}`);
 
         let tokenDoc = null;
         let tokenIdUsed = null;
@@ -1877,6 +1906,24 @@ const handleCreateCheckoutSession = async (req, res) => {
       } catch (couponError) {
         console.error("Error checking coupon:", couponError);
         // Continue without coupon if check fails
+      }
+
+      // Safety net: if they entered HARBOURVIEW or GOLDY but trial wasn't set (e.g. token lookup failed, or typo with space),
+      // still give 30 days free so they are never charged immediately.
+      const couponForFallback = (coupon && String(coupon).trim()) || "";
+      const couponNormalizedForFallback = couponForFallback.toLowerCase().replace(/\s+/g, '');
+      if ((couponNormalizedForFallback === "harbourview" || couponNormalizedForFallback === "goldy") &&
+          (!sessionParams.subscription_data || !sessionParams.subscription_data.trial_period_days)) {
+        console.warn(`Safety net: applying 30-day trial for promo "${couponForFallback}" (normalized=${couponNormalizedForFallback}, trial was not set in coupon block).`);
+        if (!sessionParams.subscription_data) sessionParams.subscription_data = {};
+        sessionParams.subscription_data.trial_period_days = 30;
+        const billedOn = new Date();
+        billedOn.setDate(billedOn.getDate() + 30);
+        const billedOnStr = billedOn.toLocaleDateString("en-AU", { year: "numeric", month: "short", day: "numeric" });
+        sessionParams.custom_text = sessionParams.custom_text || {};
+        sessionParams.custom_text.submit = {
+          message: `You will pay $0 today. Your first charge will be on ${billedOnStr} unless you cancel before then.`,
+        };
       }
     } else if (TRIAL_PERIOD_DAYS > 0) {
       // Check if trial already used
@@ -2149,10 +2196,12 @@ exports.stripeCancelSubscription = functions.https.onRequest((req, res) => {
 });
 
 const stripeCancelSubscriptionHandlerFn = (req, res) => {
-  // console.log("INCOMING REQ to cancel sub");
-  // console.log(req);
-  // console.log(req.body);
-  const uid = req.body.uid;
+  const uid = req.body && (req.body.uid != null) ? req.body.uid : null;
+  if (!uid) {
+    console.log("stripeCancelSubscription: missing uid in body", req.body);
+    res.status(400).json({ ok: false, error: "Missing uid" });
+    return Promise.resolve();
+  }
   console.log("CANCELLING SUBSCRIPTION for member with uid: " + uid);
 
   return admin
@@ -2161,45 +2210,88 @@ const stripeCancelSubscriptionHandlerFn = (req, res) => {
     .doc(uid)
     .get()
     .then(snapshot => {
-      // ## NOT THIS:
-      // console.log(snapshot.docs);
-      // snapshot.forEach(doc => console.log(doc.data()));
-      // const memberData = snapshot.docs[0].data();
-
-      // ## THIS:
+      if (!snapshot.exists) {
+        console.log("stripeCancelSubscription: no members doc for uid", uid);
+        res.status(404).json({ ok: false, error: "Member not found" });
+        return;
+      }
       const memberData = snapshot.data();
       console.log(memberData);
-      return cancelMemberSubscription(memberData.subscriptionId, res, uid);
+      const subscriptionId = memberData && memberData.subscriptionId;
+      if (!subscriptionId || typeof subscriptionId !== "string") {
+        console.log("stripeCancelSubscription: no subscriptionId for uid", uid);
+        return admin
+          .firestore()
+          .collection("members")
+          .doc(uid)
+          .update({ subscriptionActive: false })
+          .then(() => {
+            res.status(200).json({ ok: true, message: "No Stripe subscription; access cleared." });
+          })
+          .catch((err) => {
+            console.log(err);
+            res.status(500).json({ ok: false, error: err.message || "Failed to update member" });
+          });
+      }
+      return cancelMemberSubscription(subscriptionId, res, uid);
     })
     .catch(err => {
       console.log(err);
-      res.status(500).send(err);
+      res.status(500).json({ ok: false, error: err.message || String(err) });
       return;
     });
 };
 
 const cancelMemberSubscription = (subscriptionId, res, uid) => {
-  stripe.subscriptions
-    .del(subscriptionId)
-    .then(confirmation => {
-      admin
+  const stripeInstance = getStripe();
+  // Cancel at period end so the user keeps access until their paid time runs out
+  return stripeInstance.subscriptions
+    .update(subscriptionId, { cancel_at_period_end: true })
+    .then(subscription => {
+      const periodEnd = subscription.current_period_end
+        ? new Date(subscription.current_period_end * 1000)
+        : null;
+      return admin
         .firestore()
         .collection("members")
         .doc(uid)
         .update({
-          subscriptionActive: false,
+          cancelAtPeriodEnd: true,
+          ...(periodEnd && { subscriptionExpires: admin.firestore.Timestamp.fromDate(periodEnd) }),
         })
-        .then(r =>
-          console.log("subcriptionActive for " + uid + " set to false")
-        )
-        .catch(err => console.log(err));
-
-      res.status(200).send(confirmation);
-      return;
+        .then(() => {
+          console.log("Cancel at period end set for " + uid + "; access until " + (periodEnd ? periodEnd.toISOString() : "period end"));
+          res.status(200).json({
+            ok: true,
+            cancelAtPeriodEnd: true,
+            message: "Your subscription will end at the end of your current billing period. You will keep full access until then.",
+            subscriptionExpires: periodEnd ? periodEnd.toISOString() : undefined,
+          });
+        })
+        .catch(err => {
+          console.log(err);
+          res.status(500).json({ ok: false, error: err.message || "Failed to update member" });
+        });
     })
     .catch(err => {
       console.log(err);
-      res.status(500).send(err);
+      const code = err && err.code;
+      const isAlreadyCancelled = code === "resource_missing" || (err.message && err.message.toLowerCase().includes("no such subscription"));
+      if (isAlreadyCancelled) {
+        return admin
+          .firestore()
+          .collection("members")
+          .doc(uid)
+          .update({ subscriptionActive: false })
+          .then(() => {
+            res.status(200).json({ ok: true, message: "Subscription was already cancelled; access cleared." });
+          })
+          .catch((updateErr) => {
+            console.log(updateErr);
+            res.status(500).json({ ok: false, error: updateErr.message || String(updateErr) });
+          });
+      }
+      res.status(500).json({ ok: false, error: err.message || String(err) });
       return;
     });
 };
@@ -2328,20 +2420,19 @@ exports.stripeWebhookHandler = functions.https.onRequest((req, res) => {
       console.log("Subscription ID:", sessionSubscriptionId);
       console.log("Tier from session metadata:", session.metadata?.tierName, "=>", sessionTier);
 
-      // Store subscription ID and activate subscription
+      // Store subscription ID and activate subscription (set+merge so doc is always updated even if it was just created at checkout start)
       return admin
         .firestore()
         .collection("members")
         .doc(sessionUid)
         .get()
         .then(docSnapshot => {
-          const days = 30; // Initial subscription period
+          const days = 30;
           const date = new Date();
           date.setDate(date.getDate() + days + 0.65);
-
+          let subscriptionExpires = date;
           if (docSnapshot.exists) {
             const docData = docSnapshot.data();
-            // Handle Firestore Timestamp conversion
             let existingExpires = docData.subscriptionExpires;
             if (existingExpires && existingExpires.toDate) {
               existingExpires = existingExpires.toDate();
@@ -2350,43 +2441,19 @@ exports.stripeWebhookHandler = functions.https.onRequest((req, res) => {
             } else if (existingExpires && existingExpires.seconds) {
               existingExpires = new Date(existingExpires.seconds * 1000);
             }
-            
-            const subscriptionExpires =
-              date > existingExpires
-                ? date
-                : existingExpires;
-
-            // Update existing member document
-            // Ensure subscriptionExpires is a Firestore Timestamp
-            const expiresTimestamp = subscriptionExpires instanceof Date 
-              ? admin.firestore.Timestamp.fromDate(subscriptionExpires)
-              : subscriptionExpires;
-            
-            return admin
-              .firestore()
-              .collection("members")
-              .doc(sessionUid)
-              .update({
-                subscriptionId: sessionSubscriptionId,
-                subscriptionExpires: expiresTimestamp,
-                subscriptionActive: true,
-                paymentMethod: "stripe",
-                ...(sessionTier ? { tier: sessionTier } : {}),
-              });
-          } else {
-            // Create new member document
-            return admin
-              .firestore()
-              .collection("members")
-              .doc(sessionUid)
-              .set({
-                subscriptionId: sessionSubscriptionId,
-                subscriptionExpires: admin.firestore.Timestamp.fromDate(date),
-                paymentMethod: "stripe",
-                subscriptionActive: true,
-                ...(sessionTier ? { tier: sessionTier } : {}),
-              });
+            if (existingExpires && date < existingExpires) subscriptionExpires = existingExpires;
           }
+          const expiresTimestamp = subscriptionExpires instanceof Date
+            ? admin.firestore.Timestamp.fromDate(subscriptionExpires)
+            : subscriptionExpires;
+          const payload = {
+            subscriptionId: sessionSubscriptionId,
+            subscriptionExpires: expiresTimestamp,
+            subscriptionActive: true,
+            paymentMethod: "stripe",
+            ...(sessionTier ? { tier: sessionTier } : {}),
+          };
+          return admin.firestore().collection("members").doc(sessionUid).set(payload, { merge: true });
         })
         .then(() => {
           console.log("✅ SUCCESS: Subscription activated for uid:", sessionUid);
@@ -2430,7 +2497,34 @@ exports.stripeWebhookHandler = functions.https.onRequest((req, res) => {
           return res.status(500).send(`Error: ${err.message}`);
         });
 
-    // case "customer.subscription.deleted":
+    case "customer.subscription.deleted": {
+      const deletedSubId = eventObject.id;
+      console.log("customer.subscription.deleted for subscription:", deletedSubId);
+      return admin
+        .firestore()
+        .collection("members")
+        .where("subscriptionId", "==", deletedSubId)
+        .get()
+        .then(snapshot => {
+          if (!snapshot.empty) {
+            const doc = snapshot.docs[0];
+            return doc.ref.update({
+              subscriptionActive: false,
+              cancelAtPeriodEnd: admin.firestore.FieldValue.delete(),
+            }).then(() => {
+              console.log("subscriptionActive set to false for uid:", doc.id);
+              return res.send(200);
+            });
+          }
+          console.log("No member found for deleted subscription:", deletedSubId);
+          return res.send(200);
+        })
+        .catch(err => {
+          console.error("Error handling subscription.deleted:", err);
+          return res.status(500).send(err.message);
+        });
+    }
+
     case "invoice.created":
       return res.send(200);
     case "invoice.paid":
@@ -2810,6 +2904,11 @@ const validateCouponToken = (token, res) => {
           responseObj.fallback = true;
           responseObj.reusable = true;
         }
+      }
+
+      // Harbourview: valid for 1 month free with either Standard or Premium (do not restrict tier).
+      if (tokenLower === "harbourview") {
+        delete responseObj.tier;
       }
 
       if (percentOffFirstMonth === "50%") {
@@ -3201,17 +3300,14 @@ const getPayPalButtonFn = (req, res) => {
 };
 
 // Cancel PayPal subscription
-exports.paypalCancelSubscription = functions.https.onRequest(async (req, res) => {
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type');
+exports.paypalCancelSubscription = functions.https.onRequest((req, res) => {
+  const corsFn = cors();
+  corsFn(req, res, () => paypalCancelSubscriptionHandler(req, res));
+});
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
+const paypalCancelSubscriptionHandler = async (req, res) => {
+  const uid = req.body && (req.body.uid != null) ? req.body.uid : null;
 
-  const uid = req.body.uid;
-  
   if (!uid) {
     return res.status(400).json({ error: 'Missing uid' });
   }
@@ -3227,7 +3323,7 @@ exports.paypalCancelSubscription = functions.https.onRequest(async (req, res) =>
     }
     
     const userData = userDoc.data();
-    const subscriptionId = userData.paypalSubscriptionId;
+    const subscriptionId = userData.paypalSubscriptionId || userData.subscriptionId;
     
     if (!subscriptionId) {
       console.log('No PayPal subscription ID found for user');
@@ -3279,4 +3375,4 @@ exports.paypalCancelSubscription = functions.https.onRequest(async (req, res) =>
       message: error.message 
     });
   }
-});
+};

@@ -36,7 +36,6 @@ const getPayPalAccessToken = async () => {
   return data.access_token;
 };
 const url = require("url");
-const nodemailer = require("nodemailer");
 
 const querystring = require("querystring");
 const request = require("request");
@@ -54,28 +53,38 @@ const stripeLive = true; //true;
 
 // Initialize Stripe lazily (only when needed)
 let stripe = null;
+const maskedKeySuffix = (key) => {
+  const s = String(key || "");
+  return s.length > 6 ? s.slice(-6) : s;
+};
+const hasPlaceholderValue = (value) => {
+  const s = String(value || "").toLowerCase();
+  return !s || s.includes("your_") || s.includes("replace_me") || s.includes("xxxxx");
+};
+const getStripeKeyFromEnv = () => {
+  const keyName = stripeLive ? "STRIPE_KEY_LIVE" : "STRIPE_KEY_DEV";
+  const expectedPrefix = stripeLive ? "sk_live_" : "sk_test_";
+  const stripeKey = String(process.env[keyName] || "").trim();
+
+  if (!stripeKey) {
+    throw new Error(`Stripe API key not configured. Set ${keyName} in functions/.env (or deployment env).`);
+  }
+  if (hasPlaceholderValue(stripeKey)) {
+    throw new Error(`Stripe API key in ${keyName} looks like a placeholder value.`);
+  }
+  if (!stripeKey.startsWith(expectedPrefix)) {
+    throw new Error(`Stripe key mode mismatch in ${keyName}. Expected prefix ${expectedPrefix}.`);
+  }
+  return { keyName, stripeKey };
+};
 const getStripe = () => {
   if (!stripe) {
-    // Try environment variables first, then fall back to functions.config()
-    let stripeKey = stripeLive ? process.env.STRIPE_KEY_LIVE : process.env.STRIPE_KEY_DEV;
-    
-    if (!stripeKey) {
-      // Fall back to functions.config() (deprecated but still works)
-      try {
-        stripeKey = stripeLive 
-          ? functions.config().stripe_key?.live 
-          : functions.config().stripe_key?.dev;
-      } catch (e) {
-        console.error("Error accessing functions.config():", e);
-      }
-    }
-    
-    if (!stripeKey) {
-      throw new Error(`Stripe API key not configured. Please set ${stripeLive ? 'STRIPE_KEY_LIVE' : 'STRIPE_KEY_DEV'} environment variable or use functions.config().stripe_key.${stripeLive ? 'live' : 'dev'}`);
-    }
-    
+    // Single source of truth: deployment environment variables only.
+    const { keyName, stripeKey } = getStripeKeyFromEnv();
     stripe = require("stripe")(stripeKey);
-    console.log(`Stripe initialized in ${stripeLive ? 'LIVE' : 'DEV'} mode`);
+    console.log(
+      `Stripe initialized in ${stripeLive ? "LIVE" : "DEV"} mode from ${keyName} (suffix: ${maskedKeySuffix(stripeKey)})`
+    );
   }
   return stripe;
 };
@@ -84,8 +93,7 @@ const getStripe = () => {
 // Supports:
 // - env: STRIPE_WEBHOOK_SECRET_LIVE / STRIPE_WEBHOOK_SECRET_DEV
 // - env (multi): STRIPE_WEBHOOK_SECRETS_LIVE / STRIPE_WEBHOOK_SECRETS_DEV (comma-separated)
-// - functions.config(): stripe_webhook_secret.live/dev (fallback)
-// No hardcoded fallback: secrets must be configured via env or functions.config().
+// Single source of truth: deployment environment variables only.
 const getStripeWebhookSecrets = () => {
   const mode = stripeLive ? "LIVE" : "DEV";
 
@@ -101,19 +109,9 @@ const getStripeWebhookSecrets = () => {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  let fromConfig = undefined;
-  try {
-    fromConfig = stripeLive
-      ? functions.config().stripe_webhook_secret?.live
-      : functions.config().stripe_webhook_secret?.dev;
-  } catch (e) {
-    // ignore
-  }
-
   const secrets = [
     ...fromMulti,
     ...(singleEnv ? [singleEnv.trim()] : []),
-    ...(fromConfig ? [String(fromConfig).trim()] : []),
   ];
 
   const unique = Array.from(new Set(secrets)).filter(Boolean);
@@ -221,27 +219,172 @@ admin.initializeApp(_firebase);
 
 const GLOBAL_URL = "https://bridgechampions.com";
 const APP_NAME = "BridgeChampions.com";
+const SUPPORT_EMAIL = "paul.dalley@hotmail.com";
 
-// ## CONFIGURATION OF NODEMAILER WITH GMAIL ACCOUNT:
-// const gmailEmail = functions.config().gmail.email;
-// const gmailPassword = functions.config().gmail.password;
+const EMAIL_NOT_CONFIGURED_MESSAGE =
+  "Email service is not configured for this endpoint in the current deployment.";
 
-const gmailEmail = process.env.GMAIL_EMAIL;
-const gmailPassword = process.env.GMAIL_PASSWORD;
+const SYSTEM_CARD_AI_MAX_TEXT = 4000;
+const SYSTEM_CARD_AI_MAX_FIELDS = 400;
 
-let mailTransport = undefined;
+const parseJsonSafely = (raw) => {
+  try {
+    return JSON.parse(String(raw || ""));
+  } catch (e) {
+    return null;
+  }
+};
 
-try {
-  mailTransport = nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-      user: gmailEmail,
-      pass: gmailPassword,
-    },
+const normalizeConfidence = (value) => {
+  const s = String(value || "").toLowerCase();
+  if (s === "high" || s === "medium" || s === "low") return s;
+  return "medium";
+};
+
+const normalizeAllowedFields = (arr) => {
+  const fieldPattern = /^[A-Za-z0-9_]+$/;
+  const out = Array.from(new Set((arr || [])
+    .map((v) => String(v || "").trim())
+    .filter(Boolean)))
+    .filter((name) => fieldPattern.test(name))
+    .slice(0, SYSTEM_CARD_AI_MAX_FIELDS);
+  return out;
+};
+
+const extractJsonObjectFromText = (raw) => {
+  const direct = parseJsonSafely(raw);
+  if (direct) return direct;
+  const text = String(raw || "");
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first < 0 || last <= first) return null;
+  return parseJsonSafely(text.slice(first, last + 1));
+};
+
+exports.parseSystemCardAi = functions.https.onRequest((req, res) => {
+  const corsFn = cors({ origin: true });
+  corsFn(req, res, async () => {
+    if (req.method === "OPTIONS") {
+      res.status(204).send("");
+      return;
+    }
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Use POST." });
+      return;
+    }
+
+    const body = req.body || {};
+    const rawText = String(body.text || "").trim();
+    const sectionTitle = String(body.sectionTitle || "").trim();
+    const allowedFields = normalizeAllowedFields(body.allowedFields);
+    if (!rawText) {
+      res.status(400).json({ error: "Missing text." });
+      return;
+    }
+    if (allowedFields.length === 0) {
+      res.status(400).json({ error: "No allowed fields supplied." });
+      return;
+    }
+
+    const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+    if (!apiKey) {
+      res.status(503).json({ error: "AI service is not configured." });
+      return;
+    }
+    const model = String(process.env.OPENAI_MODEL || "gpt-4.1-mini").trim();
+    const truncatedText = rawText.slice(0, SYSTEM_CARD_AI_MAX_TEXT);
+
+    const systemPrompt = [
+      "You map bridge system notes to ABF system card fields.",
+      "Return strict JSON only with shape:",
+      '{"detections":[{"id":"string","title":"string","text":"string","targetFields":["field"],"confidence":"high|medium|low","rationale":"string"}],"followUps":[{"id":"string","question":"string","options":["string"],"targetFields":["field"]}]}',
+      "Use only targetFields from the allowed list supplied by user.",
+      "Keep text concise and card-ready (max 120 chars).",
+      "If uncertain, omit the detection.",
+      "Provide at most 10 detections and 3 follow-ups.",
+    ].join(" ");
+
+    const userPrompt = JSON.stringify({
+      sectionTitle,
+      allowedFields,
+      input: truncatedText,
+    });
+
+    try {
+      const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.2,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+        }),
+      });
+
+      const aiRaw = await aiRes.text();
+      const aiData = parseJsonSafely(aiRaw);
+      if (!aiRes.ok) {
+        console.error("parseSystemCardAi upstream error:", aiRaw.slice(0, 500));
+        res.status(502).json({ error: "AI provider request failed." });
+        return;
+      }
+
+      const content = ((((aiData || {}).choices || [])[0] || {}).message || {}).content || "{}";
+      const parsed = extractJsonObjectFromText(content) || {};
+      const allowedSet = new Set(allowedFields);
+
+      const detections = ((parsed.detections || []).slice(0, 10))
+        .map((d, idx) => {
+          const targetFields = ((d && d.targetFields) || [])
+            .map((v) => String(v || "").trim())
+            .filter((name) => allowedSet.has(name));
+          const text = String((d && d.text) || "").trim().slice(0, 120);
+          if (!text || targetFields.length === 0) return null;
+          return {
+            id: String((d && d.id) || `ai-det-${idx + 1}`),
+            title: String((d && d.title) || "Detected agreement").trim().slice(0, 80),
+            text,
+            targetFields,
+            confidence: normalizeConfidence(d && d.confidence),
+            rationale: String((d && d.rationale) || "").trim().slice(0, 220),
+          };
+        })
+        .filter(Boolean);
+
+      const followUps = ((parsed.followUps || []).slice(0, 3))
+        .map((q, idx) => {
+          const targetFields = ((q && q.targetFields) || [])
+            .map((v) => String(v || "").trim())
+            .filter((name) => allowedSet.has(name));
+          const options = ((q && q.options) || [])
+            .map((v) => String(v || "").trim().slice(0, 40))
+            .filter(Boolean)
+            .slice(0, 8);
+          const question = String((q && q.question) || "").trim().slice(0, 140);
+          if (!question || options.length === 0 || targetFields.length === 0) return null;
+          return {
+            id: String((q && q.id) || `ai-q-${idx + 1}`),
+            question,
+            options,
+            targetFields,
+          };
+        })
+        .filter(Boolean);
+
+      res.json({ detections, followUps });
+    } catch (err) {
+      console.error("parseSystemCardAi error:", err && err.message ? err.message : err);
+      res.status(500).json({ error: "AI parse failed." });
+    }
   });
-} catch (e) {
-  mailTransport = false;
-}
+});
 
 exports.contactUs = functions.https.onRequest((req, res) => {
   const corsFn = cors();
@@ -251,12 +394,13 @@ exports.contactUs = functions.https.onRequest((req, res) => {
 });
 const contactUs = (req, res) => {
   const { uid, email, firstName, lastName, text } = req.body;
-  const mailOptions = {
-    from: `${APP_NAME} <${gmailEmail}>`,
-    to: email,
-    bcc: gmailEmail,
-    subject: `Thank you for contacting us!`,
-  };
+  console.log("contactUs called (email disabled):", {
+    uid: uid || null,
+    email: email || null,
+    firstName: firstName || null,
+    lastName: lastName || null,
+    textLength: String(text || "").length,
+  });
   // white-smalller: "https://firebasestorage.googleapis.com/v0/b/bridgechampions.appspot.com/o/logo-white-smaller.png?alt=media&token=335dce2a-bb25-49ef-bcd6-87ba38212bb6";
   // https://firebasestorage.googleapis.com/v0/b/bridgechampions.appspot.com/o/logo-small.png?alt=media&token=afba4c94-8e85-4d7f-99f7-73367ba160cb
   // black/gray: https://firebasestorage.googleapis.com/v0/b/bridgechampions.appspot.com/o/logo-small.png?alt=media&token=afba4c94-8e85-4d7f-99f7-73367ba160cb
@@ -272,18 +416,8 @@ const contactUs = (req, res) => {
           <div><img src="https://firebasestorage.googleapis.com/v0/b/bridgechampions.appspot.com/o/logo-small.png?alt=media&token=afba4c94-8e85-4d7f-99f7-73367ba160cb"/></div>
     `;
 
-  mailOptions.html = messageBodyHtml;
-
-  if (mailTransport === undefined || mailTransport === false) {
-    return res.send(
-      "There was a problem sending your message. Please try again later."
-    );
-  }
-
-  return mailTransport.sendMail(mailOptions).then(() => {
-    // console.log('Contact Us email sent successfully for: ', email);
-    return res.send("Thanks! Your message was received.");
-  });
+  console.log("contactUs message preview (email disabled):", messageBodyHtml.slice(0, 220));
+  return res.send(`Thanks! Your message was received. You can also contact ${SUPPORT_EMAIL}.`);
 };
 
 // Your company name to include in the emails
@@ -307,32 +441,12 @@ exports.sendWelcomeEmail = functions.auth.user().onCreate(event => {
 
 // Sends a welcome email to the given user.
 function sendWelcomeEmail(email, displayName) {
-  const mailOptions = {
-    from: `${APP_NAME} <team@bridgechampions.com>`,
-    to: email,
-    subject: `Welcome to ${APP_NAME}!`,
-  };
-
-  // logo-white-bigger: https://firebasestorage.googleapis.com/v0/b/bridgechampions.appspot.com/o/logo-white-smaller.png?alt=media&token=335dce2a-bb25-49ef-bcd6-87ba38212bb6
-  const messageBodyHtml = `
-          <h2><strong>Hey ${displayName || ""}!<br/></strong></h2>
-          <h3><strong>Welcome to ${APP_NAME} - Winning Bridge made simple.</strong></h3>         
-          <p><strong>From the team at BridgeChampions.com and our player contributors, we hope you will enjoy your membership and all of the content we intend to provide you.</strong></p>
-          <p>It is a busy time for us as a new site and we hope you will join us for the journey as we introduce new features to meet our goals of providing one of the best online Bridge learning resources around.</p>
-          <p>Your feedback and thoughts are very welcome, feel free to Contact us using the contact form.</p>
-          <p>Thanks and welcome to our new community.</p>
-          <div><img src="https://firebasestorage.googleapis.com/v0/b/bridgechampions.appspot.com/o/logo-white-smaller.png?alt=media&token=335dce2a-bb25-49ef-bcd6-87ba38212bb6"/></div>
-    `;
-
-  mailOptions.html = messageBodyHtml;
-
-  if (mailTransport === undefined || mailTransport === false) {
-    return;
-  }
-
-  return mailTransport.sendMail(mailOptions).then(() => {
-    return console.log("New welcome email sent to:", email);
+  console.log("sendWelcomeEmail skipped:", {
+    email: email || null,
+    displayName: displayName || null,
+    reason: EMAIL_NOT_CONFIGURED_MESSAGE,
   });
+  return null;
 }
 
 // [START sendByeEmail]
@@ -505,6 +619,8 @@ const getBillingPlanAgreement = (req, billingPlanId) => {
     payer: {
       payment_method: "paypal",
     },
+    // So IPN notifications include our uid and we can update the right member
+    custom: req.body.uid || "",
     override_merchant_preferences: {
       return_url: `${req.protocol}://${req.get("host")}/process?uid=${
         req.body.uid
@@ -649,8 +765,24 @@ const billingPlanFn = (req, outerRes) => {
 exports.process = functions.https.onRequest((req, res) => {
   const token = req.query.token;
   const uid = req.query.uid;
-  console.log("PROCESSING THE PAYMENT NOW:");
-  executePaymentAgreement(token, uid, req, res);
+  console.log("PROCESSING THE PAYMENT NOW:", { hasToken: !!token, hasUid: !!uid, queryKeys: Object.keys(req.query || {}) });
+  if (token && uid) {
+    return executePaymentAgreement(token, uid, req, res);
+  }
+
+  // Hosted PayPal button flow: there is no billing-agreement token in return URL.
+  // Subscription activation is handled asynchronously by IPN.
+  if (!token && uid) {
+    console.log("process: hosted-button return detected (no token). Redirecting to success; waiting for IPN.");
+    return res.redirect("https://bridgechampions.com/success");
+  }
+
+  if (!uid) {
+    // Some hosted-button return URLs may omit custom query params.
+    // Do not hard-fail here; IPN handles actual activation.
+    console.warn("process: missing uid on return; redirecting to success and awaiting IPN.");
+    return res.redirect("https://bridgechampions.com/success");
+  }
 
   // let uid;
   // let storedToken;
@@ -1255,9 +1387,11 @@ exports.ipnHandler = functions.https.onRequest((req, res) => {
 
   const payment_gross = Number(ipnTransactionMessage.payment_gross);
   const mc_gross = Number(ipnTransactionMessage.mc_gross);
-  const uid = ipnTransactionMessage.custom;
+  let uid = ipnTransactionMessage.custom;
   const token = ipnTransactionMessage.invoice;
   console.log("FOR UID: ", uid);
+  if (!uid) console.warn("IPN: custom (uid) is missing; will try to resolve by subscriptionId");
+  if (!(ipnTransactionMessage && ipnTransactionMessage.btn_id)) console.warn("IPN: btn_id is missing; tier will default to basic");
   console.log("WITH TOKEN: ", token);
   console.log("WHO IS PAYING payment_gross: " + payment_gross);
   console.log("WHO IS PAYING mc_gross: " + mc_gross);
@@ -1287,79 +1421,130 @@ exports.ipnHandler = functions.https.onRequest((req, res) => {
           `Verified IPN: IPN message for Transaction ID: ${ipnTransactionMessage.txn_id} is verified.`
         );
 
-        const eventType = ipnTransactionMessage.txn_type;
-        console.log("EVENT TYPE IS: " + eventType);
-        // console.log("EVENT IS A subscr_signup?: " + (eventType==="subscr_signup"));
-        // console.log("EVENT IS A subscr_payment: " + (eventType==="subscr_payment"));
+        const eventTypeRaw = ipnTransactionMessage.txn_type || ipnTransactionMessage.transaction_type || "";
+        const eventType = String(eventTypeRaw || "").trim();
+        const paymentStatus = String(ipnTransactionMessage.payment_status || "").toLowerCase();
+        console.log("EVENT TYPE IS: " + (eventType || "(none)"));
+        console.log("PAYMENT STATUS IS: " + (paymentStatus || "(none)"));
 
-        // ensure that if the payment was 0 and there was a token,
-        // we delete the token so it cant be reused:
-        // - payment_gross, token, mc_gross
-        // if (token && (payment_gross === 0 || mc_gross === 0)) {
-        //     paypalDeleteUsedToken(token);
-        // }
+        // Resolve uid: from IPN custom, or by looking up member by subscription id (for manually added members / old agreements without custom)
+        const resolveUid = () => {
+          if (uid) return Promise.resolve(uid);
+          const subscrId = ipnTransactionMessage.subscr_id || ipnTransactionMessage.recurring_payment_id;
+          if (!subscrId) return Promise.resolve(null);
+          return admin.firestore().collection("members").where("subscriptionId", "==", subscrId).limit(1).get()
+            .then(snap => (snap.empty ? null : snap.docs[0].id));
+        };
+
+        return resolveUid().then(resolvedUid => {
+          const uidToUse = resolvedUid || uid;
+          if (!uidToUse && eventType !== "recurring_payment_profile_cancel") {
+            console.warn("IPN: no uid (custom) and could not resolve by subscription id; ignoring.");
+            return res.status(200).end();
+          }
+          if (uidToUse && !uid) console.log("IPN: resolved uid from subscriptionId lookup:", uidToUse);
+
+          // Some hosted-button IPNs arrive without txn_type. Normalize common payment statuses.
+          // Ignore refunds/reversals/failed statuses so we never grant time on negative/failed transactions.
+          if (["refunded", "reversed", "failed", "denied", "voided"].includes(paymentStatus)) {
+            console.log("IPN: non-crediting status detected, ignoring:", paymentStatus);
+            return res.status(200).end();
+          }
+
+          const applySignupDays = () => {
+            // Check if token is a promo code (invoice from PayPal)
+            if (token) {
+              const tokenTrim = String(token || "").trim();
+              const tokenLower = tokenTrim.toLowerCase();
+              const tokenNoSpaces = tokenLower.replace(/\s+/g, "");
+              const tokenUpper = tokenTrim.toUpperCase();
+              const candidateTokenIds = promoTokenFirestoreDocIds(tokenTrim, tokenLower, tokenNoSpaces, tokenUpper);
+              const isHarbourview = isHarbourviewPromoCode(tokenNoSpaces);
+              const isGoldy = isGoldyPromoCode(tokenNoSpaces);
+
+              const resolvePromoAndApply = () => {
+                let promoDoc = null;
+                let tokenIdUsed = null;
+                return Promise.all(candidateTokenIds.map((id) =>
+                  admin.firestore().collection("userTokens").doc(id).get()
+                )).then((docs) => {
+                  for (let i = 0; i < docs.length; i++) {
+                    if (docs[i].exists) {
+                      promoDoc = docs[i];
+                      tokenIdUsed = candidateTokenIds[i];
+                      break;
+                    }
+                  }
+                  let extraDays = 0;
+                  if (promoDoc && promoDoc.exists) {
+                    const promoData = promoDoc.data();
+                    extraDays = Number(promoData.daysFree) || 0;
+                    if (isHarbourview || isGoldy) extraDays = 30;
+                    if (!promoData.reusable && !promoData.testMode) {
+                      admin.firestore().collection("userTokens").doc(tokenIdUsed).delete();
+                      console.log(`Promo code ${tokenIdUsed} applied (single-use) and deleted: ${extraDays} free days`);
+                    } else {
+                      console.log(`Promo code ${tokenIdUsed} applied (reusable): ${extraDays} free days`);
+                    }
+                  } else if (isHarbourview || isGoldy) {
+                    extraDays = 30;
+                    console.log(`Promo code ${token} (normalized: ${tokenNoSpaces}) not in Firestore; applying safety-net 30 days`);
+                  }
+                  return checkIfTrialUsed(uidToUse).then((trialUsed) => {
+                    const baseDays = 30;
+                    const trialDays = trialUsed ? 0 : 7;
+                    const totalDays = baseDays + trialDays + extraDays;
+                    console.log(`Total days for subscription: ${totalDays} (base: ${baseDays}, trial: ${trialDays}, promo: ${extraDays})`);
+                    return addMonthToSubscriptionIPN(req, res, uidToUse, totalDays, ipnTransactionMessage);
+                  });
+                });
+              };
+
+              return resolvePromoAndApply().catch((err) => {
+                console.log("Error processing promo code:", err);
+                const fallbackDays = (isHarbourview || isGoldy) ? 30 : 0;
+                return checkIfTrialUsed(uidToUse).then((trialUsed) => {
+                  const baseDays = 30;
+                  const trialDays = trialUsed ? 0 : 7;
+                  const totalDays = baseDays + trialDays + fallbackDays;
+                  return addMonthToSubscriptionIPN(req, res, uidToUse, totalDays, ipnTransactionMessage);
+                });
+              });
+            }
+
+            return checkIfTrialUsed(uidToUse).then((trialUsed) => {
+              return addMonthToSubscriptionIPN(req, res, uidToUse, trialUsed ? 30 : 37, ipnTransactionMessage);
+            });
+          };
 
         switch (eventType) {
           case "recurring_payment_profile_cancel":
             return res.status(200).end();
 
           case "subscr_signup":
-            // Check if token is a promo code
-            if (token) {
-              return admin.firestore().collection("userTokens").doc(token).get()
-                .then(promoDoc => {
-                  let extraDays = 0;
-                  
-                  if (promoDoc.exists) {
-                    const promoData = promoDoc.data();
-                    extraDays = promoData.daysFree || 0;
-                    
-                    // Delete the promo code so it can't be reused
-                    admin.firestore().collection("userTokens").doc(token).delete();
-                    
-                    console.log(`Promo code ${token} applied: ${extraDays} free days`);
-                  }
-                  
-                  // Check if they've used trial before
-                  return checkIfTrialUsed(uid).then(trialUsed => {
-                    const baseDays = 30;
-                    const trialDays = trialUsed ? 0 : 7;
-                    const totalDays = baseDays + trialDays + extraDays;
-                    
-                    console.log(`Total days for subscription: ${totalDays} (base: ${baseDays}, trial: ${trialDays}, promo: ${extraDays})`);
-                    return addMonthToSubscriptionIPN(req, res, uid, totalDays, ipnTransactionMessage);
-                  });
-                })
-                .catch(err => {
-                  console.log("Error processing promo code:", err);
-                  return checkIfTrialUsed(uid).then(trialUsed => {
-                    return addMonthToSubscriptionIPN(req, res, uid, trialUsed ? 30 : 37, ipnTransactionMessage);
-                  });
-                });
-            } else {
-              return checkIfTrialUsed(uid).then(trialUsed => {
-                return addMonthToSubscriptionIPN(req, res, uid, trialUsed ? 30 : 37, ipnTransactionMessage);
-              });
-            }
-          // return addMonthToSubscriptionIPN(req, res, uid, 7);
+            return applySignupDays();
+
+          case "web_accept":
+            // Hosted buttons can send web_accept instead of subscr_signup.
+            return applySignupDays();
 
           case "subscr_payment":
-            if (payment_gross === 0 && mc_gross === 0) {
+            if ((payment_gross || 0) <= 0 && (mc_gross || 0) <= 0) {
               res.status(200).end();
               return;
             }
-            return addMonthToSubscriptionIPN(req, res, uid, 30, ipnTransactionMessage);
+            return addMonthToSubscriptionIPN(req, res, uidToUse, 30, ipnTransactionMessage);
 
           case "subscr_cancel":
             return admin
               .firestore()
               .collection("members")
-              .doc(uid)
+              .doc(uidToUse)
               .update({
                 subscriptionActive: false,
               })
               .then(r => {
-                console.log("subcriptionActive for " + uid + " set to false");
+                console.log("subcriptionActive for " + uidToUse + " set to false");
                 return res.status(200).end();
               })
               .catch(err => {
@@ -1368,8 +1553,14 @@ exports.ipnHandler = functions.https.onRequest((req, res) => {
               });
 
           default:
+            // Fallback for hosted-button IPNs that omit txn_type but still indicate a successful payment.
+            if (!eventType && ["completed", "processed"].includes(paymentStatus)) {
+              console.log("IPN: missing txn_type but successful payment status, applying signup-day logic.");
+              return applySignupDays();
+            }
             return res.status(200).end();
         }
+        }); // end resolveUid().then(uidToUse => ...)
 
         // TODO: Implement post verification logic on ipnTransactionMessage
         // if (ipnTransactionMessage.txn_type === 'recurring_payment_profile_cancel') {
@@ -1448,17 +1639,21 @@ const addMonthToSubscriptionIPN = (req, res, uid, days, ipnTransactionMessage) =
       tier = "premium";
     }
     console.log(`PayPal button ID: ${buttonId}, Setting tier: ${tier}`);
+  } else {
+    console.warn("addMonthToSubscriptionIPN: btn_id missing, tier defaulting to basic");
   }
-  
+  const subscrId = ipnTransactionMessage && (ipnTransactionMessage.subscr_id || ipnTransactionMessage.recurring_payment_id);
+  const update = {
+    subscriptionExpires: date,
+    paymentMethod: "paypal",
+    subscriptionActive: true,
+    trialUsed: true,
+    tier: tier,
+  };
+  if (subscrId) update.subscriptionId = subscrId;
   ref
     .set(
-      {
-        subscriptionExpires: date,
-        paymentMethod: "paypal",
-        subscriptionActive: true,
-        trialUsed: true,
-        tier: tier,
-      },
+      update,
       { merge: true }
     )
     .then(innerRes => {
@@ -1503,7 +1698,7 @@ const paypalDeleteUsedToken = token => {
 
 // Stripe webhook secrets must be provided via env/functions.config() (see getStripeWebhookSecrets()).
 
-const TRIAL_PERIOD_DAYS = 0; // 7;
+const TRIAL_PERIOD_DAYS = 0; // Set to 7 to enable 7-day trial for new subscribers (see PARKED_7_DAY_TRIAL.md)
 
 // Step 1: create the customer on Signup:
 exports.stripeSubscribeTokenHandler = functions.https.onRequest((req, res) => {
@@ -1800,17 +1995,18 @@ const handleCreateCheckoutSession = async (req, res) => {
     };
 
     // Add coupon if provided (promo token in Firestore)
-    if (coupon && coupon !== '') {
+    const couponTrimmed = (coupon && String(coupon).trim()) || "";
+    if (couponTrimmed !== '') {
       try {
         // Try multiple Firestore doc IDs to handle legacy casing and spaces (e.g. "harbour view" -> harbourview).
-        const couponTrim = String(coupon).trim();
+        const couponTrim = couponTrimmed;
         const couponLower = couponTrim.toLowerCase();
         const couponNoSpaces = couponLower.replace(/\s+/g, '');
         const couponUpper = couponTrim.toUpperCase();
-        const isHarbourview = couponNoSpaces === "harbourview";
-        const isGoldy = couponNoSpaces === "goldy";
+        const isHarbourview = isHarbourviewPromoCode(couponNoSpaces);
+        const isGoldy = isGoldyPromoCode(couponNoSpaces);
 
-        const candidateTokenIds = Array.from(new Set([couponTrim, couponLower, couponNoSpaces, couponUpper])).filter(Boolean);
+        const candidateTokenIds = promoTokenFirestoreDocIds(couponTrim, couponLower, couponNoSpaces, couponUpper);
         console.log(`Looking up promo token. entered="${couponTrim}" normalized="${couponNoSpaces}" candidates=${JSON.stringify(candidateTokenIds)}`);
 
         let tokenDoc = null;
@@ -1840,6 +2036,17 @@ const handleCreateCheckoutSession = async (req, res) => {
         if (tokenDoc && tokenDoc.exists) {
           const tokenData = tokenDoc.data() || {};
           console.log("Promo code token data:", tokenData);
+
+          // Enforce promo tier compatibility with requested checkout tier.
+          // Prevents mismatches like selecting Basic while using a Premium-only promo.
+          const requestedTier = normalizeTier(tierName || "");
+          const promoTier = normalizeTier(tokenData.tier || "");
+          if (promoTier && requestedTier && promoTier !== requestedTier) {
+            return res.status(400).json({
+              error: "Promo code applies to a different tier",
+              details: `This promo is valid for ${promoTier} only.`,
+            });
+          }
 
           // Persist both the entered code and the resolved Firestore token id for webhook processing.
           sessionParams.metadata = sessionParams.metadata || {};
@@ -1896,23 +2103,46 @@ const handleCreateCheckoutSession = async (req, res) => {
             }
           }
           
+          // Override price with token's stripePriceId (e.g. ausyouth = $20/month instead of $50)
+          if (tokenData.stripePriceId && typeof tokenData.stripePriceId === "string" && tokenData.stripePriceId.startsWith("price_")) {
+            sessionParams.line_items[0].price = tokenData.stripePriceId;
+            console.log(`Promo overrides price to: ${tokenData.stripePriceId}`);
+          }
+
           // Only delete the token if it's NOT a test/reusable token
           // Test tokens should have testMode: true or reusable: true in Firestore
           if (!tokenData.testMode && !tokenData.reusable) {
             // Delete the used token (will be done after successful checkout in webhook)
             // For now, we'll let the webhook handle deletion
           }
+        } else if (!(isHarbourview || isGoldy)) {
+          // Coupon was provided but not found in Firestore (and not a safety-net promo)
+          // Reject so user isn't charged without their promo - avoids complaints
+          console.warn(`Promo code "${couponTrim}" not found in Firestore`);
+          return res.status(400).json({
+            error: "Invalid promo code",
+            details: "The promo code you entered was not found. Please check the spelling and try again, or proceed without a promo code.",
+          });
         }
       } catch (couponError) {
         console.error("Error checking coupon:", couponError);
-        // Continue without coupon if check fails
+        // For harbourview/goldy we have fallback below. For others, fail rather than charge without promo.
+        const couponForCheck = (coupon && String(coupon).trim()) || "";
+        const norm = couponForCheck.toLowerCase().replace(/\s+/g, "");
+        if (!isHarbourviewPromoCode(norm) && norm !== "goldy") {
+          return res.status(500).json({
+            error: "Could not verify promo code",
+            details: "Please try again or contact support if the problem persists.",
+          });
+        }
+        // harbourview/blue/goldy: fall through to safety net below
       }
 
       // Safety net: if they entered HARBOURVIEW or GOLDY but trial wasn't set (e.g. token lookup failed, or typo with space),
       // still give 30 days free so they are never charged immediately.
-      const couponForFallback = (coupon && String(coupon).trim()) || "";
+      const couponForFallback = couponTrimmed;
       const couponNormalizedForFallback = couponForFallback.toLowerCase().replace(/\s+/g, '');
-      if ((couponNormalizedForFallback === "harbourview" || couponNormalizedForFallback === "goldy") &&
+      if ((isHarbourviewPromoCode(couponNormalizedForFallback) || couponNormalizedForFallback === "goldy") &&
           (!sessionParams.subscription_data || !sessionParams.subscription_data.trial_period_days)) {
         console.warn(`Safety net: applying 30-day trial for promo "${couponForFallback}" (normalized=${couponNormalizedForFallback}, trial was not set in coupon block).`);
         if (!sessionParams.subscription_data) sessionParams.subscription_data = {};
@@ -1924,29 +2154,6 @@ const handleCreateCheckoutSession = async (req, res) => {
         sessionParams.custom_text.submit = {
           message: `You will pay $0 today. Your first charge will be on ${billedOnStr} unless you cancel before then.`,
         };
-      }
-    } else if (TRIAL_PERIOD_DAYS > 0) {
-      // Check if trial already used
-      try {
-        const trialUsed = await checkIfTrialUsed(uid);
-        if (!trialUsed) {
-          sessionParams.subscription_data.trial_period_days = TRIAL_PERIOD_DAYS;
-
-          const billedOn = new Date();
-          billedOn.setDate(billedOn.getDate() + TRIAL_PERIOD_DAYS);
-          const billedOnStr = billedOn.toLocaleDateString("en-AU", {
-            year: "numeric",
-            month: "short",
-            day: "numeric",
-          });
-          sessionParams.custom_text = sessionParams.custom_text || {};
-          sessionParams.custom_text.submit = {
-            message: `You will pay $0 today. Your first charge will be on ${billedOnStr} unless you cancel before then.`,
-          };
-        }
-      } catch (trialError) {
-        console.error("Error checking trial status:", trialError);
-        // Continue without trial if check fails
       }
     }
     
@@ -2339,7 +2546,69 @@ const cancelMemberSubscription = (subscriptionId, res, uid) => {
 //         amount: 0,
 //     });
 // }
+
+// Helper: sync a Stripe subscription to Firestore members doc. Returns true if updated.
+async function syncStripeSubscriptionToMember(subscription) {
+  let uid = subscription.metadata?.uid;
+  if (!uid) {
+    const stripeInstance = getStripe();
+    const sessions = await stripeInstance.checkout.sessions.list({ subscription: subscription.id, limit: 1 });
+    if (sessions.data?.length) uid = sessions.data[0].metadata?.uid;
+  }
+  if (!uid && subscription.customer) {
+    const stripeInstance = getStripe();
+    const customer = typeof subscription.customer === "string"
+      ? await stripeInstance.customers.retrieve(subscription.customer)
+      : subscription.customer;
+    const email = customer?.email;
+    if (email) {
+      const users = await admin.auth().listUsers(1000);
+      const match = users.users.find((u) => (u.email || "").toLowerCase() === email.toLowerCase());
+      if (match) uid = match.uid;
+    }
+  }
+  if (!uid) return false;
+
+  const trialEnd = subscription.trial_end ? new Date(subscription.trial_end * 1000) : null;
+  const periodEnd = subscription.current_period_end ? new Date(subscription.current_period_end * 1000) : null;
+  const expiresDate = trialEnd || periodEnd || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  const memberRef = admin.firestore().collection("members").doc(uid);
+  const memberSnap = await memberRef.get();
+  const data = memberSnap.exists ? memberSnap.data() : {};
+  if (data.subscriptionActive === true && data.subscriptionExpires) return false;
+
+  await memberRef.set({
+    subscriptionId: subscription.id,
+    subscriptionExpires: admin.firestore.Timestamp.fromDate(expiresDate),
+    subscriptionActive: true,
+    paymentMethod: "stripe",
+    tier: normalizeTier(subscription.items?.data?.[0]?.price?.product?.name) || "premium",
+    stripeStatus: subscription.status,
+    ...(trialEnd && { stripeTrialEnd: trialEnd.toISOString() }),
+    syncedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+  return true;
+}
+
+// Scheduled: daily sync of Stripe subscriptions to Firestore (catches webhook/success-page misses)
+async function runScheduledStripeSync() {
+  const stripeInstance = getStripe();
+  const subs = await stripeInstance.subscriptions.list({
+    status: "all",
+    limit: 100,
+    expand: ["data.customer", "data.items.data.price"],
+  });
+  let updated = 0;
+  for (const sub of subs.data) {
+    if (sub.status !== "trialing" && sub.status !== "active") continue;
+    const didUpdate = await syncStripeSubscriptionToMember(sub);
+    if (didUpdate) updated++;
+  }
+  console.log("Scheduled Stripe sync complete:", updated, "member(s) updated");
+}
+
 exports.stripeWebhookHandler = functions.https.onRequest((req, res) => {
+  const sendOk = () => res.status(200).send("OK");
   console.log("stripeWebhookHandler called");
   const signature = req.headers["stripe-signature"];
   if (!signature) {
@@ -2391,6 +2660,7 @@ exports.stripeWebhookHandler = functions.https.onRequest((req, res) => {
     return;
   }
 
+  try {
   // Safe access to event payload ONLY after verification
   const eventObject = reconstructedEvent?.data?.object || {};
   const subscriptionId = eventObject.subscription;
@@ -2413,47 +2683,64 @@ exports.stripeWebhookHandler = functions.https.onRequest((req, res) => {
         console.error("Session metadata:", JSON.stringify(session.metadata, null, 2));
         console.error("Full session object keys:", Object.keys(session));
         // Still return 200 to Stripe so they don't retry, but log the error
-        return res.send(200);
+        return sendOk();
       }
 
       console.log("Processing checkout session for uid:", sessionUid);
       console.log("Subscription ID:", sessionSubscriptionId);
       console.log("Tier from session metadata:", session.metadata?.tierName, "=>", sessionTier);
 
-      // Store subscription ID and activate subscription (set+merge so doc is always updated even if it was just created at checkout start)
-      return admin
-        .firestore()
-        .collection("members")
-        .doc(sessionUid)
-        .get()
-        .then(docSnapshot => {
-          const days = 30;
-          const date = new Date();
-          date.setDate(date.getDate() + days + 0.65);
-          let subscriptionExpires = date;
-          if (docSnapshot.exists) {
-            const docData = docSnapshot.data();
-            let existingExpires = docData.subscriptionExpires;
-            if (existingExpires && existingExpires.toDate) {
-              existingExpires = existingExpires.toDate();
-            } else if (existingExpires && typeof existingExpires === 'string') {
-              existingExpires = new Date(existingExpires);
-            } else if (existingExpires && existingExpires.seconds) {
-              existingExpires = new Date(existingExpires.seconds * 1000);
-            }
-            if (existingExpires && date < existingExpires) subscriptionExpires = existingExpires;
-          }
-          const expiresTimestamp = subscriptionExpires instanceof Date
-            ? admin.firestore.Timestamp.fromDate(subscriptionExpires)
-            : subscriptionExpires;
-          const payload = {
-            subscriptionId: sessionSubscriptionId,
-            subscriptionExpires: expiresTimestamp,
-            subscriptionActive: true,
-            paymentMethod: "stripe",
-            ...(sessionTier ? { tier: sessionTier } : {}),
-          };
-          return admin.firestore().collection("members").doc(sessionUid).set(payload, { merge: true });
+      // Store subscription ID and activate subscription. Use subscription's trial_end/period_end for correct promo expiry.
+      const getExpiresFromSubscription = async () => {
+        if (!sessionSubscriptionId) return null;
+        try {
+          const stripeInstance = getStripe();
+          const sub = await stripeInstance.subscriptions.retrieve(sessionSubscriptionId, {
+            expand: ["items.data.price"],
+          });
+          const trialEnd = sub.trial_end ? new Date(sub.trial_end * 1000) : null;
+          const periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+          return trialEnd || periodEnd || null;
+        } catch (e) {
+          console.warn("Could not fetch subscription for expiry (fallback to 30 days):", e.message);
+          return null;
+        }
+      };
+
+      return getExpiresFromSubscription()
+        .then(stripeExpires => {
+          const fallbackDate = new Date();
+          fallbackDate.setDate(fallbackDate.getDate() + 30 + 0.65);
+          let subscriptionExpires = stripeExpires || fallbackDate;
+          return admin.firestore().collection("members").doc(sessionUid).get()
+            .then(docSnapshot => {
+              if (docSnapshot.exists) {
+                const docData = docSnapshot.data();
+                let existingExpires = docData.subscriptionExpires;
+                if (existingExpires && existingExpires.toDate) {
+                  existingExpires = existingExpires.toDate();
+                } else if (existingExpires && typeof existingExpires === "string") {
+                  existingExpires = new Date(existingExpires);
+                } else if (existingExpires && existingExpires.seconds) {
+                  existingExpires = new Date(existingExpires.seconds * 1000);
+                }
+                if (existingExpires && subscriptionExpires < existingExpires) {
+                  subscriptionExpires = existingExpires;
+                }
+              }
+              const expiresTimestamp = subscriptionExpires instanceof Date
+                ? admin.firestore.Timestamp.fromDate(subscriptionExpires)
+                : subscriptionExpires;
+              const payload = {
+                subscriptionId: sessionSubscriptionId,
+                subscriptionExpires: expiresTimestamp,
+                subscriptionActive: true,
+                paymentMethod: "stripe",
+                trialUsed: true,
+                ...(sessionTier ? { tier: sessionTier } : {}),
+              };
+              return admin.firestore().collection("members").doc(sessionUid).set(payload, { merge: true });
+            });
         })
         .then(() => {
           console.log("✅ SUCCESS: Subscription activated for uid:", sessionUid);
@@ -2479,9 +2766,9 @@ exports.stripeWebhookHandler = functions.https.onRequest((req, res) => {
                 console.error("Error handling promo code deletion:", err);
                 // Don't fail the whole process if promo deletion fails
               })
-              .then(() => res.send(200));
+              .then(() => sendOk());
           } else {
-            return res.send(200);
+            return sendOk();
           }
         })
         .catch(err => {
@@ -2493,9 +2780,25 @@ exports.stripeWebhookHandler = functions.https.onRequest((req, res) => {
             uid: sessionUid,
             subscriptionId: sessionSubscriptionId
           });
-          // Return 500 so Stripe will retry
           return res.status(500).send(`Error: ${err.message}`);
         });
+
+    case "customer.subscription.created":
+    case "customer.subscription.updated": {
+      const subObj = eventObject;
+      if (subObj.status !== "trialing" && subObj.status !== "active") {
+        return sendOk();
+      }
+      return syncStripeSubscriptionToMember(subObj)
+        .then(updated => {
+          if (updated) console.log("Synced subscription to member:", subObj.id);
+          return sendOk();
+        })
+        .catch(err => {
+          console.error("Error syncing subscription:", err);
+          return res.status(500).send(err.message);
+        });
+    }
 
     case "customer.subscription.deleted": {
       const deletedSubId = eventObject.id;
@@ -2513,11 +2816,11 @@ exports.stripeWebhookHandler = functions.https.onRequest((req, res) => {
               cancelAtPeriodEnd: admin.firestore.FieldValue.delete(),
             }).then(() => {
               console.log("subscriptionActive set to false for uid:", doc.id);
-              return res.send(200);
+              return sendOk();
             });
           }
           console.log("No member found for deleted subscription:", deletedSubId);
-          return res.send(200);
+          return sendOk();
         })
         .catch(err => {
           console.error("Error handling subscription.deleted:", err);
@@ -2526,24 +2829,17 @@ exports.stripeWebhookHandler = functions.https.onRequest((req, res) => {
     }
 
     case "invoice.created":
-      return res.send(200);
+      return sendOk();
     case "invoice.paid":
-    case "invoice.payment_succeeded":
+    case "invoice.payment_succeeded": {
       // case "charge.succeeded":
       if (amountPaid === 0) {
         console.log("Nothing was paid, do not add time");
-        return res.send(200);
+        return sendOk();
       }
 
       console.log("invoice payment succeeded for event: ", reconstructedEvent.type);
-      console.log("Adding month to subscription: ");
-      console.log("Subscription ID:");
-      console.log(subscriptionId);
-
-      // TRYING TO GET METADATA FROM THE invoice paid event:
-      // uidFromEvent = event.data.object.metadata.uid;
-      // console.log("UID DELIVERED FROM EVENT OBJECT: ", uidFromEvent);
-      // return addMonthToSubscriptionStripeWebhook(req, res, uidFromEvent);
+      console.log("Subscription ID:", subscriptionId);
 
       return admin
         .firestore()
@@ -2551,20 +2847,31 @@ exports.stripeWebhookHandler = functions.https.onRequest((req, res) => {
         .where("subscriptionId", "==", subscriptionId)
         .get()
         .then(snapshot => {
+          if (snapshot.empty) {
+            console.warn("invoice.payment_succeeded: no member found for subscriptionId:", subscriptionId);
+            return sendOk();
+          }
           uid = snapshot.docs[0].id;
-          console.log(uid);
-          return addMonthToSubscriptionStripeWebhook(req, res, uid);
+          console.log("Adding month for uid:", uid);
+          return addMonthToSubscriptionStripeWebhook(req, res, uid, sendOk);
         })
         .catch(err => {
-          console.log(err);
-          return res.send(500);
+          console.error("Error in invoice.payment_succeeded:", err);
+          return res.status(500).send(err.message || "Internal error");
         });
+    }
 
     // case "customer.subscription.deleted":
 
     default:
-      console.log("SOME OTHER EVENT OCCURRED: ", reconstructedEvent.type);
-      return res.send(200);
+      console.log("Unhandled event type:", reconstructedEvent.type);
+      return sendOk();
+  }
+  } catch (unhandledErr) {
+    console.error("Stripe webhook unhandled error:", unhandledErr);
+    if (!res.headersSent) {
+      return res.status(500).send(unhandledErr.message || "Webhook handler error");
+    }
   }
 });
 
@@ -2715,6 +3022,149 @@ exports.adminCreateUserAndGrantAccess = functions.https.onRequest((req, res) => 
   });
 });
 
+// Admin-only: return list of subscriber emails (members with active subscription).
+exports.adminGetSubscriberEmails = functions.https.onRequest((req, res) => {
+  const corsFn = cors();
+  corsFn(req, res, async () => {
+    if (req.method !== "GET") {
+      return res.status(405).json({ error: "Method Not Allowed" });
+    }
+    try {
+      const authHeader = req.get("authorization") || req.get("Authorization") || "";
+      const match = authHeader.match(/^Bearer\s+(.+)$/i);
+      if (!match) {
+        return res.status(401).json({ error: "Missing Authorization: Bearer <token>" });
+      }
+      const decoded = await admin.auth().verifyIdToken(match[1]);
+      const callerUid = decoded.uid;
+      const ADMIN_UID_ALLOWLIST = [
+        "LGoDI1jEsidKRyN5aVvcTFA8Svb2",
+        "8vNtPo121PZmzbfivs7xInxu2a62",
+      ];
+      let callerIsAdmin = ADMIN_UID_ALLOWLIST.includes(callerUid);
+      if (!callerIsAdmin) {
+        const userDoc = await admin.firestore().collection("users").doc(callerUid).get();
+        callerIsAdmin = userDoc.exists && userDoc.data() && userDoc.data().OK === true;
+      }
+      if (!callerIsAdmin) {
+        return res.status(403).json({ error: "Forbidden: admin only" });
+      }
+
+      const membersSnap = await admin.firestore().collection("members").get();
+      const now = Date.now();
+      const emails = [];
+      for (const doc of membersSnap.docs) {
+        const data = doc.data();
+        const uid = doc.id;
+        const exp = data.subscriptionExpires;
+        const expiresAt = exp
+          ? (typeof exp.toMillis === "function"
+            ? exp.toMillis()
+            : (typeof exp.toDate === "function"
+              ? exp.toDate().getTime()
+              : new Date(exp).getTime()))
+          : 0;
+        const hasValidExpiry = expiresAt > now;
+        const explicitlyActive = data && data.subscriptionActive === true;
+        const hasFutureExpiry = data && exp != null && hasValidExpiry;
+        const isActive = !!(explicitlyActive && hasValidExpiry) || !!hasFutureExpiry;
+        if (!isActive) continue;
+        const paymentMethod = (data.paymentMethod || "").toLowerCase();
+        if (paymentMethod !== "stripe" && paymentMethod !== "paypal") continue;
+        try {
+          const userRecord = await admin.auth().getUser(uid);
+          if (userRecord && userRecord.email) emails.push(userRecord.email);
+        } catch (_) {}
+      }
+      return res.status(200).json({ emails, count: emails.length });
+    } catch (err) {
+      console.error("adminGetSubscriberEmails error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  });
+});
+
+function isPayingSubscriber(data, now) {
+  const exp = data.subscriptionExpires;
+  const expiresAt = exp
+    ? (typeof exp.toMillis === "function"
+      ? exp.toMillis()
+      : (typeof exp.toDate === "function"
+        ? exp.toDate().getTime()
+        : new Date(exp).getTime()))
+    : 0;
+  const hasValidExpiry = expiresAt > now;
+  const explicitlyActive = data && data.subscriptionActive === true;
+  const hasFutureExpiry = data && exp != null && hasValidExpiry;
+  const isActive = !!(explicitlyActive && hasValidExpiry) || !!hasFutureExpiry;
+  if (!isActive) return false;
+  const paymentMethod = (data.paymentMethod || "").toLowerCase();
+  return paymentMethod === "stripe" || paymentMethod === "paypal";
+}
+
+// Admin-only: return emails of users who signed up since a date and are NOT paying subscribers.
+exports.adminGetNonSubscriberEmailsSinceDate = functions.https.onRequest((req, res) => {
+  const corsFn = cors();
+  corsFn(req, res, async () => {
+    if (req.method !== "GET") {
+      return res.status(405).json({ error: "Method Not Allowed" });
+    }
+    try {
+      const authHeader = req.get("authorization") || req.get("Authorization") || "";
+      const match = authHeader.match(/^Bearer\s+(.+)$/i);
+      if (!match) {
+        return res.status(401).json({ error: "Missing Authorization: Bearer <token>" });
+      }
+      const decoded = await admin.auth().verifyIdToken(match[1]);
+      const callerUid = decoded.uid;
+      const ADMIN_UID_ALLOWLIST = [
+        "LGoDI1jEsidKRyN5aVvcTFA8Svb2",
+        "8vNtPo121PZmzbfivs7xInxu2a62",
+      ];
+      let callerIsAdmin = ADMIN_UID_ALLOWLIST.includes(callerUid);
+      if (!callerIsAdmin) {
+        const userDoc = await admin.firestore().collection("users").doc(callerUid).get();
+        callerIsAdmin = userDoc.exists && userDoc.data() && userDoc.data().OK === true;
+      }
+      if (!callerIsAdmin) {
+        return res.status(403).json({ error: "Forbidden: admin only" });
+      }
+
+      const sinceParam = (req.query && req.query.since) || "2025-01-01";
+      const sinceDate = new Date(sinceParam);
+      if (isNaN(sinceDate.getTime())) {
+        return res.status(400).json({ error: "Invalid since date (use YYYY-MM-DD)" });
+      }
+      const sinceMs = sinceDate.getTime();
+      const now = Date.now();
+
+      const payingSubscriberUids = new Set();
+      const membersSnap = await admin.firestore().collection("members").get();
+      for (const doc of membersSnap.docs) {
+        if (isPayingSubscriber(doc.data(), now)) payingSubscriberUids.add(doc.id);
+      }
+
+      const emails = [];
+      let nextPageToken;
+      do {
+        const result = await admin.auth().listUsers(1000, nextPageToken);
+        for (const u of result.users) {
+          const created = u.metadata && u.metadata.creationTime ? new Date(u.metadata.creationTime).getTime() : 0;
+          if (created < sinceMs) continue;
+          if (payingSubscriberUids.has(u.uid)) continue;
+          if (u.email) emails.push(u.email);
+        }
+        nextPageToken = result.pageToken;
+      } while (nextPageToken);
+
+      return res.status(200).json({ emails, count: emails.length });
+    } catch (err) {
+      console.error("adminGetNonSubscriberEmailsSinceDate error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  });
+});
+
 const addMonthToSubscriptionStripe = (req, res, uid, days, message) => {
   const ref = admin.firestore().collection("members").doc(uid);
   // ##** CHANGED THIS FROM days to 30 + days on initial processing of transaction:
@@ -2791,12 +3241,12 @@ const addMonthToSubscriptionStripe = (req, res, uid, days, message) => {
   //     });
 };
 
-const addMonthToSubscriptionStripeWebhook = (req, res, uid, days = 30) => {
+const addMonthToSubscriptionStripeWebhook = (req, res, uid, daysOrSendOk = 30, maybeSendOk = null) => {
+  const days = typeof daysOrSendOk === "number" ? daysOrSendOk : 30;
+  const sendOk = typeof daysOrSendOk === "function" ? daysOrSendOk : (typeof maybeSendOk === "function" ? maybeSendOk : () => res.status(200).send("OK"));
   const ref = admin.firestore().collection("members").doc(uid);
   const date = new Date();
   date.setDate(date.getDate() + days + 0.65);
-
-  // const transactionRef = admin.firestore().collection('members').doc(uid);
 
   return admin.firestore().runTransaction(transaction => {
     return transaction
@@ -2822,16 +3272,13 @@ const addMonthToSubscriptionStripeWebhook = (req, res, uid, days = 30) => {
           });
         }
       })
-      .then(innerRes => {
-        console.log("COMPLETED ADDING MONTH TO SUB FOR USER WITH UID:" + uid);
-        return res.send(200);
-        // res.status(200).end();
-        // return;
+      .then(() => {
+        console.log("COMPLETED ADDING MONTH TO SUB FOR USER WITH UID:", uid);
+        return sendOk();
       })
       .catch(err => {
-        console.log(err);
-        // return;
-        return res.send(500); // .send("");
+        console.error("addMonthToSubscriptionStripeWebhook error:", err);
+        return res.status(500).send(err.message || "Transaction failed");
       });
   });
 
@@ -2853,20 +3300,113 @@ const addMonthToSubscriptionStripeWebhook = (req, res, uid, days = 30) => {
   //     });
 };
 
+// --- Promo helpers: keep validation/checkout/IPN behaviour aligned ---
+// "blue" is the public alias for harbourview on the membership page; Coupons posts "BLUE" without client-side aliasing.
+function isHarbourviewPromoCode(tokenNoSpaces) {
+  return tokenNoSpaces === "harbourview" || tokenNoSpaces === "blue";
+}
+function isGoldyPromoCode(tokenNoSpaces) {
+  return tokenNoSpaces === "goldy";
+}
+/** Firestore doc ids to try (casing variants + blue → harbourview document). */
+function promoTokenFirestoreDocIds(tokenTrim, tokenLower, tokenNoSpaces, tokenUpper) {
+  const ids = new Set([tokenTrim, tokenLower, tokenNoSpaces, tokenUpper].filter(Boolean));
+  if (isHarbourviewPromoCode(tokenNoSpaces)) {
+    ["harbourview", "HARBOURVIEW", "Harbourview", "HarbourView"].forEach((id) => ids.add(id));
+  }
+  return Array.from(ids);
+}
+/**
+ * Whitelist only JSON-safe fields the web app expects. Prevents 500s if a token doc
+ * contains Firestore Timestamps, nested maps, or other non-JSON values.
+ */
+function buildSafeTokenResponseForClient(merged) {
+  const src = merged && typeof merged === "object" ? merged : {};
+  const out = {};
+  if (src.daysFree !== undefined && src.daysFree !== null && src.daysFree !== "") {
+    const d = Number(src.daysFree);
+    if (Number.isFinite(d)) out.daysFree = d;
+  }
+  if (src.monthlyPrice !== undefined && src.monthlyPrice !== null && src.monthlyPrice !== "") {
+    const mp = Number(src.monthlyPrice);
+    if (Number.isFinite(mp)) out.monthlyPrice = mp;
+  }
+  if (src.reusable !== undefined) out.reusable = Boolean(src.reusable);
+  if (typeof src.tier === "string" && src.tier.length) out.tier = src.tier;
+  if (typeof src.stripePriceId === "string" && src.stripePriceId.length) out.stripePriceId = src.stripePriceId;
+  if (typeof src.percentOffFirstMonth === "string") out.percentOffFirstMonth = src.percentOffFirstMonth;
+  if (typeof src.paypalButtonUrl === "string") out.paypalButtonUrl = src.paypalButtonUrl;
+  if (src.fallback === true) out.fallback = true;
+  if (typeof src.canonicalTokenId === "string" && src.canonicalTokenId.length) out.canonicalTokenId = src.canonicalTokenId;
+  return out;
+}
+
+/**
+ * Never read req.body.token directly — req.body is often undefined until parsed.
+ * Same pattern as handleCreateCheckoutSession (rawBody JSON fallback).
+ */
+function extractPromoTokenFromHttpRequest(req) {
+  let body = req.body;
+  if ((body === undefined || body === null) && req.rawBody) {
+    try {
+      const raw =
+        typeof req.rawBody === "string" ? req.rawBody : req.rawBody.toString("utf8");
+      body = JSON.parse(raw);
+    } catch (e) {
+      body = null;
+    }
+  }
+  if (body === undefined || body === null) body = {};
+  const fromBody = body.token != null ? String(body.token) : "";
+  const fromQuery = req.query && req.query.token != null ? String(req.query.token) : "";
+  return (fromBody || fromQuery).trim();
+}
+
 exports.validateUserToken = functions.https.onRequest((req, res) => {
-  const corsFn = cors();
+  const corsFn = cors({ origin: true });
   corsFn(req, res, () => {
-    return validateCouponToken(req.body.token, res);
+    if (req.method === "OPTIONS") {
+      return res.status(204).send("");
+    }
+    const token = extractPromoTokenFromHttpRequest(req);
+    const p = validateCouponToken(token, res);
+    if (p && typeof p.catch === "function") {
+      return p.catch((e) => {
+        console.error("validateUserToken unhandled:", e);
+        if (!res.headersSent) {
+          res.status(500).json({ error: "server_error", message: String(e && e.message ? e.message : e) });
+        }
+      });
+    }
+    return p;
   });
 });
 
 const validateCouponToken = (token, res) => {
   const tokenTrim = String(token || "").trim();
   const tokenLower = tokenTrim.toLowerCase();
+  const tokenNoSpaces = tokenLower.replace(/\s+/g, "");
   const tokenUpper = tokenTrim.toUpperCase();
-  const candidateIds = Array.from(new Set([tokenTrim, tokenLower, tokenUpper])).filter(Boolean);
+  const candidateIds = promoTokenFirestoreDocIds(tokenTrim, tokenLower, tokenNoSpaces, tokenUpper);
 
   const tokensCol = admin.firestore().collection("userTokens");
+
+  const sendTokenSuccess = (payload) => {
+    const safe = buildSafeTokenResponseForClient(payload);
+    // Never ship harbourview/blue/goldy without a positive daysFree (whitelist can drop bad Firestore types).
+    if (isHarbourviewPromoCode(tokenNoSpaces) || isGoldyPromoCode(tokenNoSpaces)) {
+      const d = Number(safe.daysFree);
+      if (!Number.isFinite(d) || d < 1) {
+        safe.daysFree = 30;
+        safe.reusable = true;
+        safe.fallback = true;
+      }
+      if (!safe.canonicalTokenId) {
+        safe.canonicalTokenId = isGoldyPromoCode(tokenNoSpaces) ? "goldy" : "harbourview";
+      }
+    }
+    return res.status(200).json(safe);
+  };
 
   return (async () => {
     try {
@@ -2882,22 +3422,25 @@ const validateCouponToken = (token, res) => {
       }
 
       if (!foundDoc) {
-        // Safety-net promos: should always validate as 30 days free.
-        if (tokenLower === "harbourview" || tokenLower === "goldy") {
-          return res.send(200, { daysFree: 30, reusable: true, fallback: true, canonicalTokenId: tokenLower });
+        // Safety-net promos: always validate as 30 days free (harbourview / blue / goldy).
+        if (isHarbourviewPromoCode(tokenNoSpaces) || isGoldyPromoCode(tokenNoSpaces)) {
+          return sendTokenSuccess({
+            daysFree: 30,
+            reusable: true,
+            fallback: true,
+            canonicalTokenId: isGoldyPromoCode(tokenNoSpaces) ? "goldy" : "harbourview",
+          });
         }
-        return res.send(404);
+        return res.status(404).json({ error: "not_found" });
       }
 
-      const responseObj = foundDoc.data() || {};
+      const responseObj = { ...(foundDoc.data() || {}) };
       const percentOffFirstMonth = responseObj.percentOffFirstMonth;
 
-      // Helpful for debugging/consistency downstream
       responseObj.canonicalTokenId = foundId;
 
-      // Safety-net promos: should always be treated as 30 days free,
-      // even if the Firestore doc exists but is missing/misconfigured.
-      if (tokenLower === "harbourview" || tokenLower === "goldy") {
+      // Safety-net promos: always at least 30 days free if doc is misconfigured.
+      if (isHarbourviewPromoCode(tokenNoSpaces) || isGoldyPromoCode(tokenNoSpaces)) {
         const daysFreeNum = Number(responseObj.daysFree || 0);
         if (!daysFreeNum) {
           responseObj.daysFree = 30;
@@ -2906,8 +3449,8 @@ const validateCouponToken = (token, res) => {
         }
       }
 
-      // Harbourview: valid for 1 month free with either Standard or Premium (do not restrict tier).
-      if (tokenLower === "harbourview") {
+      // Harbourview family: valid for either tier (do not restrict tier).
+      if (isHarbourviewPromoCode(tokenNoSpaces)) {
         delete responseObj.tier;
       }
 
@@ -2917,10 +3460,24 @@ const validateCouponToken = (token, res) => {
         responseObj["paypalButtonUrl"] = PAYPAL_BUTTON_ADDRESS_25off;
       }
 
-      return res.send(200, responseObj);
+      return sendTokenSuccess(responseObj);
     } catch (err) {
       console.error("validateUserToken error:", err);
-      return res.send(404, err);
+      // Last-resort: never brick harbourview/blue/goldy if serialization or Firestore hiccups.
+      const t = String(token || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "");
+      if (isHarbourviewPromoCode(t) || isGoldyPromoCode(t)) {
+        console.warn("validateUserToken: error path harbourview-family fallback for token:", t);
+        return sendTokenSuccess({
+          daysFree: 30,
+          reusable: true,
+          fallback: true,
+          canonicalTokenId: isGoldyPromoCode(t) ? "goldy" : "harbourview",
+        });
+      }
+      return res.status(500).json({ error: "server_error", message: String(err && err.message ? err.message : err) });
     }
   })();
 };
@@ -3026,6 +3583,19 @@ exports.scheduledFunctionCrontab = functions.pubsub
   .onRun(context => {
     console.log("--- Daily UPDATE for quiz and articles ---");
     updateDailies(context);
+  });
+
+// Daily sync of Stripe subscriptions to Firestore (catches webhook/success-page misses)
+exports.scheduledSyncStripeSubscriptions = functions.pubsub
+  .schedule("0 7 * * *")
+  .timeZone("America/New_York")
+  .onRun(async () => {
+    console.log("--- Daily Stripe subscription sync ---");
+    try {
+      await runScheduledStripeSync();
+    } catch (err) {
+      console.error("Scheduled Stripe sync failed:", err);
+    }
   });
 
 const updateDailies = res => {

@@ -1459,7 +1459,7 @@ exports.ipnHandler = functions.https.onRequest((req, res) => {
               const tokenNoSpaces = tokenLower.replace(/\s+/g, "");
               const tokenUpper = tokenTrim.toUpperCase();
               const candidateTokenIds = promoTokenFirestoreDocIds(tokenTrim, tokenLower, tokenNoSpaces, tokenUpper);
-              const isHarbourview = isHarbourviewPromoCode(tokenNoSpaces);
+              const isBlue = isBluePromoCode(tokenNoSpaces);
               const isGoldy = isGoldyPromoCode(tokenNoSpaces);
 
               const resolvePromoAndApply = () => {
@@ -1479,22 +1479,28 @@ exports.ipnHandler = functions.https.onRequest((req, res) => {
                   if (promoDoc && promoDoc.exists) {
                     const promoData = promoDoc.data();
                     extraDays = Number(promoData.daysFree) || 0;
-                    if (isHarbourview || isGoldy) extraDays = 30;
+                    if (isBlue || isGoldy) extraDays = 30;
                     if (!promoData.reusable && !promoData.testMode) {
                       admin.firestore().collection("userTokens").doc(tokenIdUsed).delete();
                       console.log(`Promo code ${tokenIdUsed} applied (single-use) and deleted: ${extraDays} free days`);
                     } else {
                       console.log(`Promo code ${tokenIdUsed} applied (reusable): ${extraDays} free days`);
                     }
-                  } else if (isHarbourview || isGoldy) {
+                  } else if (isBlue || isGoldy) {
                     extraDays = 30;
                     console.log(`Promo code ${token} (normalized: ${tokenNoSpaces}) not in Firestore; applying safety-net 30 days`);
                   }
                   return checkIfTrialUsed(uidToUse).then((trialUsed) => {
-                    const baseDays = 30;
-                    const trialDays = trialUsed ? 0 : 7;
-                    const totalDays = baseDays + trialDays + extraDays;
-                    console.log(`Total days for subscription: ${totalDays} (base: ${baseDays}, trial: ${trialDays}, promo: ${extraDays})`);
+                    let totalDays;
+                    if (isBlue || isGoldy) {
+                      // Partner codes: exactly one month free — do not add the usual 7-day trial on top.
+                      totalDays = extraDays > 0 ? extraDays : 30;
+                    } else {
+                      const baseDays = 30;
+                      const trialDays = trialUsed ? 0 : 7;
+                      totalDays = baseDays + trialDays + extraDays;
+                    }
+                    console.log(`Total days for subscription: ${totalDays} (promo blue/goldy=${isBlue || isGoldy}, extraDays=${extraDays})`);
                     return addMonthToSubscriptionIPN(req, res, uidToUse, totalDays, ipnTransactionMessage);
                   });
                 });
@@ -1502,11 +1508,16 @@ exports.ipnHandler = functions.https.onRequest((req, res) => {
 
               return resolvePromoAndApply().catch((err) => {
                 console.log("Error processing promo code:", err);
-                const fallbackDays = (isHarbourview || isGoldy) ? 30 : 0;
+                const fallbackDays = (isBlue || isGoldy) ? 30 : 0;
                 return checkIfTrialUsed(uidToUse).then((trialUsed) => {
-                  const baseDays = 30;
-                  const trialDays = trialUsed ? 0 : 7;
-                  const totalDays = baseDays + trialDays + fallbackDays;
+                  let totalDays;
+                  if (isBlue || isGoldy) {
+                    totalDays = fallbackDays;
+                  } else {
+                    const baseDays = 30;
+                    const trialDays = trialUsed ? 0 : 7;
+                    totalDays = baseDays + trialDays + fallbackDays;
+                  }
                   return addMonthToSubscriptionIPN(req, res, uidToUse, totalDays, ipnTransactionMessage);
                 });
               });
@@ -1729,7 +1740,8 @@ const handleSubscribeToken = (req, res) => {
             const tokenData = doc.data();
             let coupon = undefined;
             if (tokenData.daysFree) {
-              freeDays += Number(tokenData.daysFree);
+              // Promo defines the full trial — do not stack TRIAL_PERIOD_DAYS on top of daysFree.
+              freeDays = Number(tokenData.daysFree);
             }
             if (tokenData.percentOffFirstMonth === "50%") {
               coupon = "_50_percent_off";
@@ -2003,7 +2015,13 @@ const handleCreateCheckoutSession = async (req, res) => {
         const couponLower = couponTrim.toLowerCase();
         const couponNoSpaces = couponLower.replace(/\s+/g, '');
         const couponUpper = couponTrim.toUpperCase();
-        const isHarbourview = isHarbourviewPromoCode(couponNoSpaces);
+        if (couponNoSpaces === "harbourview") {
+          return res.status(400).json({
+            error: "Invalid promo code",
+            details: "That promo code is no longer valid. Please use the current code (BLUE).",
+          });
+        }
+        const isBlue = isBluePromoCode(couponNoSpaces);
         const isGoldy = isGoldyPromoCode(couponNoSpaces);
 
         const candidateTokenIds = promoTokenFirestoreDocIds(couponTrim, couponLower, couponNoSpaces, couponUpper);
@@ -2022,7 +2040,7 @@ const handleCreateCheckoutSession = async (req, res) => {
 
         // Safety-net promos: should always yield a 30-day free trial.
         // This prevents accidental immediate charges when the Firestore token is missing/misconfigured.
-        if ((!tokenDoc || !tokenDoc.exists) && (isHarbourview || isGoldy)) {
+        if ((!tokenDoc || !tokenDoc.exists) && (isBlue || isGoldy)) {
           console.warn(
             `${couponLower.toUpperCase()} promo token not found in Firestore. Applying fallback 30-day trial to prevent immediate charge.`
           );
@@ -2060,11 +2078,12 @@ const handleCreateCheckoutSession = async (req, res) => {
           
           // Handle free days - add trial period (prioritize this over percentage discounts)
           // If daysFree is set, use trial period instead of charging immediately
-          const effectiveDaysFree = (isHarbourview || isGoldy) ? 30 : tokenData.daysFree;
+          const effectiveDaysFree = (isBlue || isGoldy) ? 30 : tokenData.daysFree;
 
           if (effectiveDaysFree !== undefined && effectiveDaysFree !== null) {
-            const freeDays = Number(effectiveDaysFree) + TRIAL_PERIOD_DAYS;
-            console.log(`Promo code daysFree: ${effectiveDaysFree} (override=${isHarbourview || isGoldy}), total trial days: ${freeDays}`);
+            // Promo defines the full Stripe trial — do not stack TRIAL_PERIOD_DAYS (e.g. 7-day site trial) on top.
+            const freeDays = Number(effectiveDaysFree);
+            console.log(`Promo code daysFree: ${effectiveDaysFree} (override=${isBlue || isGoldy}), total trial days: ${freeDays}`);
             if (freeDays > 0) {
               // Ensure subscription_data exists
               if (!sessionParams.subscription_data) {
@@ -2115,7 +2134,7 @@ const handleCreateCheckoutSession = async (req, res) => {
             // Delete the used token (will be done after successful checkout in webhook)
             // For now, we'll let the webhook handle deletion
           }
-        } else if (!(isHarbourview || isGoldy)) {
+        } else if (!(isBlue || isGoldy)) {
           // Coupon was provided but not found in Firestore (and not a safety-net promo)
           // Reject so user isn't charged without their promo - avoids complaints
           console.warn(`Promo code "${couponTrim}" not found in Firestore`);
@@ -2129,7 +2148,7 @@ const handleCreateCheckoutSession = async (req, res) => {
         // For harbourview/goldy we have fallback below. For others, fail rather than charge without promo.
         const couponForCheck = (coupon && String(coupon).trim()) || "";
         const norm = couponForCheck.toLowerCase().replace(/\s+/g, "");
-        if (!isHarbourviewPromoCode(norm) && norm !== "goldy") {
+        if (!isBluePromoCode(norm) && norm !== "goldy") {
           return res.status(500).json({
             error: "Could not verify promo code",
             details: "Please try again or contact support if the problem persists.",
@@ -2142,7 +2161,7 @@ const handleCreateCheckoutSession = async (req, res) => {
       // still give 30 days free so they are never charged immediately.
       const couponForFallback = couponTrimmed;
       const couponNormalizedForFallback = couponForFallback.toLowerCase().replace(/\s+/g, '');
-      if ((isHarbourviewPromoCode(couponNormalizedForFallback) || couponNormalizedForFallback === "goldy") &&
+      if ((isBluePromoCode(couponNormalizedForFallback) || couponNormalizedForFallback === "goldy") &&
           (!sessionParams.subscription_data || !sessionParams.subscription_data.trial_period_days)) {
         console.warn(`Safety net: applying 30-day trial for promo "${couponForFallback}" (normalized=${couponNormalizedForFallback}, trial was not set in coupon block).`);
         if (!sessionParams.subscription_data) sessionParams.subscription_data = {};
@@ -3301,17 +3320,20 @@ const addMonthToSubscriptionStripeWebhook = (req, res, uid, daysOrSendOk = 30, m
 };
 
 // --- Promo helpers: keep validation/checkout/IPN behaviour aligned ---
-// "blue" is the public alias for harbourview on the membership page; Coupons posts "BLUE" without client-side aliasing.
-function isHarbourviewPromoCode(tokenNoSpaces) {
-  return tokenNoSpaces === "harbourview" || tokenNoSpaces === "blue";
+// "blue" is the public promo code. The legacy string "harbourview" is no longer accepted (use "blue").
+function isBluePromoCode(tokenNoSpaces) {
+  return tokenNoSpaces === "blue";
 }
 function isGoldyPromoCode(tokenNoSpaces) {
   return tokenNoSpaces === "goldy";
 }
-/** Firestore doc ids to try (casing variants + blue → harbourview document). */
+/** Firestore doc ids to try (casing variants + blue → legacy harbourview document id in Firestore). */
 function promoTokenFirestoreDocIds(tokenTrim, tokenLower, tokenNoSpaces, tokenUpper) {
+  if (tokenNoSpaces === "harbourview") {
+    return [];
+  }
   const ids = new Set([tokenTrim, tokenLower, tokenNoSpaces, tokenUpper].filter(Boolean));
-  if (isHarbourviewPromoCode(tokenNoSpaces)) {
+  if (isBluePromoCode(tokenNoSpaces)) {
     ["harbourview", "HARBOURVIEW", "Harbourview", "HarbourView"].forEach((id) => ids.add(id));
   }
   return Array.from(ids);
@@ -3387,6 +3409,9 @@ const validateCouponToken = (token, res) => {
   const tokenLower = tokenTrim.toLowerCase();
   const tokenNoSpaces = tokenLower.replace(/\s+/g, "");
   const tokenUpper = tokenTrim.toUpperCase();
+  if (tokenNoSpaces === "harbourview") {
+    return res.status(404).json({ error: "not_found" });
+  }
   const candidateIds = promoTokenFirestoreDocIds(tokenTrim, tokenLower, tokenNoSpaces, tokenUpper);
 
   const tokensCol = admin.firestore().collection("userTokens");
@@ -3394,7 +3419,7 @@ const validateCouponToken = (token, res) => {
   const sendTokenSuccess = (payload) => {
     const safe = buildSafeTokenResponseForClient(payload);
     // Never ship harbourview/blue/goldy without a positive daysFree (whitelist can drop bad Firestore types).
-    if (isHarbourviewPromoCode(tokenNoSpaces) || isGoldyPromoCode(tokenNoSpaces)) {
+    if (isBluePromoCode(tokenNoSpaces) || isGoldyPromoCode(tokenNoSpaces)) {
       const d = Number(safe.daysFree);
       if (!Number.isFinite(d) || d < 1) {
         safe.daysFree = 30;
@@ -3402,7 +3427,7 @@ const validateCouponToken = (token, res) => {
         safe.fallback = true;
       }
       if (!safe.canonicalTokenId) {
-        safe.canonicalTokenId = isGoldyPromoCode(tokenNoSpaces) ? "goldy" : "harbourview";
+        safe.canonicalTokenId = isGoldyPromoCode(tokenNoSpaces) ? "goldy" : "blue";
       }
     }
     return res.status(200).json(safe);
@@ -3423,12 +3448,12 @@ const validateCouponToken = (token, res) => {
 
       if (!foundDoc) {
         // Safety-net promos: always validate as 30 days free (harbourview / blue / goldy).
-        if (isHarbourviewPromoCode(tokenNoSpaces) || isGoldyPromoCode(tokenNoSpaces)) {
+        if (isBluePromoCode(tokenNoSpaces) || isGoldyPromoCode(tokenNoSpaces)) {
           return sendTokenSuccess({
             daysFree: 30,
             reusable: true,
             fallback: true,
-            canonicalTokenId: isGoldyPromoCode(tokenNoSpaces) ? "goldy" : "harbourview",
+            canonicalTokenId: isGoldyPromoCode(tokenNoSpaces) ? "goldy" : "blue",
           });
         }
         return res.status(404).json({ error: "not_found" });
@@ -3440,7 +3465,7 @@ const validateCouponToken = (token, res) => {
       responseObj.canonicalTokenId = foundId;
 
       // Safety-net promos: always at least 30 days free if doc is misconfigured.
-      if (isHarbourviewPromoCode(tokenNoSpaces) || isGoldyPromoCode(tokenNoSpaces)) {
+      if (isBluePromoCode(tokenNoSpaces) || isGoldyPromoCode(tokenNoSpaces)) {
         const daysFreeNum = Number(responseObj.daysFree || 0);
         if (!daysFreeNum) {
           responseObj.daysFree = 30;
@@ -3450,7 +3475,7 @@ const validateCouponToken = (token, res) => {
       }
 
       // Harbourview family: valid for either tier (do not restrict tier).
-      if (isHarbourviewPromoCode(tokenNoSpaces)) {
+      if (isBluePromoCode(tokenNoSpaces)) {
         delete responseObj.tier;
       }
 
@@ -3468,13 +3493,13 @@ const validateCouponToken = (token, res) => {
         .trim()
         .toLowerCase()
         .replace(/\s+/g, "");
-      if (isHarbourviewPromoCode(t) || isGoldyPromoCode(t)) {
+      if (isBluePromoCode(t) || isGoldyPromoCode(t)) {
         console.warn("validateUserToken: error path harbourview-family fallback for token:", t);
         return sendTokenSuccess({
           daysFree: 30,
           reusable: true,
           fallback: true,
-          canonicalTokenId: isGoldyPromoCode(t) ? "goldy" : "harbourview",
+          canonicalTokenId: isGoldyPromoCode(t) ? "goldy" : "blue",
         });
       }
       return res.status(500).json({ error: "server_error", message: String(err && err.message ? err.message : err) });

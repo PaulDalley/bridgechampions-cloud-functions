@@ -132,6 +132,22 @@ const normalizeTier = (tierName) => {
   return undefined;
 };
 
+// Best-effort tier inference from Stripe subscription item details.
+// Never default to premium here; unknown should remain undefined.
+const inferTierFromSubscription = (subscription) => {
+  const item = subscription?.items?.data?.[0];
+  const metadataTier =
+    normalizeTier(subscription?.metadata?.tierName) ||
+    normalizeTier(subscription?.metadata?.tier);
+  const nicknameTier = normalizeTier(item?.price?.nickname);
+  const productTier =
+    normalizeTier(item?.price?.product?.name) ||
+    normalizeTier(item?.plan?.product?.name);
+  const intervalTier = normalizeTier(item?.price?.recurring?.interval);
+  // Only trust explicit tier-like strings. "month" etc. will normalize to undefined.
+  return metadataTier || nicknameTier || productTier || intervalTier;
+};
+
 // const stripe = require('stripe')(functions.config().stripe_key.live);
 // const planId = "prod_CaO9pAb9VQ0QNI"; // <- $15.99 / month plan
 
@@ -1955,9 +1971,18 @@ const handleCreateCheckoutSession = async (req, res) => {
     console.log("Creating checkout session with body:", body, "coupon present:", !!body.coupon);
     const { priceId, email, uid, coupon, tierName } = body;
     
-    if (!priceId || !email || !uid) {
-      console.error("Missing required parameters:", { priceId: !!priceId, email: !!email, uid: !!uid });
-      return res.status(400).json({ error: 'Missing required parameters: priceId, email, and uid are required' });
+    const normalizedTier = normalizeTier(tierName);
+    if (!priceId || !email || !uid || !normalizedTier) {
+      console.error("Missing/invalid checkout parameters:", {
+        priceId: !!priceId,
+        email: !!email,
+        uid: !!uid,
+        tierName,
+        normalizedTier,
+      });
+      return res.status(400).json({
+        error: "Missing required parameters: priceId, email, uid, and valid tierName are required",
+      });
     }
 
     // Ensure members doc exists so webhook/success can always update it (avoids "no doc" when webhook or success fails)
@@ -1992,7 +2017,7 @@ const handleCreateCheckoutSession = async (req, res) => {
       customer_email: email,
       metadata: {
         uid: uid,
-        tierName: tierName || 'Premium',
+        tierName: normalizedTier,
         promoCode: coupon || '', // Store promo code for webhook processing
       },
       success_url: successUrl,
@@ -2057,7 +2082,7 @@ const handleCreateCheckoutSession = async (req, res) => {
 
           // Enforce promo tier compatibility with requested checkout tier.
           // Prevents mismatches like selecting Basic while using a Premium-only promo.
-          const requestedTier = normalizeTier(tierName || "");
+          const requestedTier = normalizedTier;
           const promoTier = normalizeTier(tokenData.tier || "");
           if (promoTier && requestedTier && promoTier !== requestedTier) {
             return res.status(400).json({
@@ -2596,16 +2621,28 @@ async function syncStripeSubscriptionToMember(subscription) {
   const data = memberSnap.exists ? memberSnap.data() : {};
   if (data.subscriptionActive === true && data.subscriptionExpires) return false;
 
-  await memberRef.set({
+  const inferredTier = inferTierFromSubscription(subscription);
+  const updatePayload = {
     subscriptionId: subscription.id,
     subscriptionExpires: admin.firestore.Timestamp.fromDate(expiresDate),
     subscriptionActive: true,
     paymentMethod: "stripe",
-    tier: normalizeTier(subscription.items?.data?.[0]?.price?.product?.name) || "premium",
     stripeStatus: subscription.status,
     ...(trialEnd && { stripeTrialEnd: trialEnd.toISOString() }),
     syncedAt: admin.firestore.FieldValue.serverTimestamp(),
-  }, { merge: true });
+  };
+
+  // Never auto-upgrade by fallback. If tier can't be inferred, preserve existing Firestore tier.
+  if (inferredTier) {
+    updatePayload.tier = inferredTier;
+  } else {
+    console.warn(
+      "Could not infer tier from Stripe subscription during sync; preserving existing tier",
+      { subscriptionId: subscription.id, uid }
+    );
+  }
+
+  await memberRef.set(updatePayload, { merge: true });
   return true;
 }
 
@@ -2615,7 +2652,7 @@ async function runScheduledStripeSync() {
   const subs = await stripeInstance.subscriptions.list({
     status: "all",
     limit: 100,
-    expand: ["data.customer", "data.items.data.price"],
+    expand: ["data.customer", "data.items.data.price", "data.items.data.price.product"],
   });
   let updated = 0;
   for (const sub of subs.data) {
@@ -2902,7 +2939,7 @@ exports.manualActivateSubscription = functions.https.onRequest((req, res) => {
       return res.status(405).send('Method Not Allowed');
     }
 
-    const { uid, subscriptionId, days = 30, tier = 'premium' } = req.body;
+    const { uid, subscriptionId, days = 30, tier = "basic" } = req.body || {};
     
     if (!uid) {
       return res.status(400).json({ error: 'Missing uid parameter' });
@@ -2915,12 +2952,17 @@ exports.manualActivateSubscription = functions.https.onRequest((req, res) => {
       const memberRef = admin.firestore().collection("members").doc(uid);
       const memberDoc = await memberRef.get();
 
+      const normalizedTier = normalizeTier(tier);
+      if (!normalizedTier) {
+        return res.status(400).json({ error: "Invalid tier. Use 'basic' or 'premium'." });
+      }
+
       const updateData = {
         subscriptionId: subscriptionId || 'manual',
         subscriptionExpires: admin.firestore.Timestamp.fromDate(date),
         subscriptionActive: true,
         paymentMethod: subscriptionId ? "stripe" : "manual",
-        tier: tier,
+        tier: normalizedTier,
       };
 
       if (memberDoc.exists) {
@@ -2940,7 +2982,7 @@ exports.manualActivateSubscription = functions.https.onRequest((req, res) => {
         success: true, 
         message: `Subscription activated for ${uid}`,
         subscriptionExpires: date.toISOString(),
-        tier: tier
+        tier: normalizedTier
       });
     } catch (error) {
       console.error('Error activating subscription:', error);
@@ -2982,14 +3024,17 @@ exports.adminCreateUserAndGrantAccess = functions.https.onRequest((req, res) => 
         return res.status(403).json({ error: "Forbidden: admin only" });
       }
 
-      const { email, tier = "premium", days = 365 } = req.body || {};
+      const { email, tier = "basic", days = 365 } = req.body || {};
       const emailStr = typeof email === "string" ? email.trim() : "";
       if (!emailStr) {
         return res.status(400).json({ error: "Missing email" });
       }
 
       const daysNum = Math.max(1, Math.min(3650, Number(days) || 365)); // cap at 10y
-      const tierName = tier === "basic" ? "basic" : "premium";
+      const tierName = normalizeTier(tier);
+      if (!tierName) {
+        return res.status(400).json({ error: "Invalid tier. Use 'basic' or 'premium'." });
+      }
 
       // Create or fetch the Auth user
       let userRecord;
@@ -3365,7 +3410,7 @@ function buildSafeTokenResponseForClient(merged) {
 
 /**
  * Never read req.body.token directly — req.body is often undefined until parsed.
- * Same pattern as handleCreateCheckoutSession (rawBody JSON fallback).
+ * jQuery $.post sends application/x-www-form-urlencoded (token=blue), not JSON — JSON.parse on rawBody fails unless we parse as querystring.
  */
 function extractPromoTokenFromHttpRequest(req) {
   let body = req.body;
@@ -3373,7 +3418,11 @@ function extractPromoTokenFromHttpRequest(req) {
     try {
       const raw =
         typeof req.rawBody === "string" ? req.rawBody : req.rawBody.toString("utf8");
-      body = JSON.parse(raw);
+      try {
+        body = JSON.parse(raw);
+      } catch (e) {
+        body = querystring.parse(raw);
+      }
     } catch (e) {
       body = null;
     }
